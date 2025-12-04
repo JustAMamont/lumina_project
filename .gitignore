@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+.pytest_cache/
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Lumina Specific
+logs/
+*.ldb
+*.log
+lumina/*.so
+
+# Others
+summary.py
+sum.txt

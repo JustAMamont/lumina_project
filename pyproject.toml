@@ -1,0 +1,23 @@
+[build-system]
+requires = [
+    "maturin>=1.10.2",
+    "patchelf>=0.17.2",
+    "ziglang>=0.13.0"
+]
+build-backend = "maturin"
+
+[project]
+name = "lumina"
+version = "0.1.0"
+description = "Structured, Binary Logging for Python (Rust Backend)"
+requires-python = ">=3.12"
+readme = "README.md"
+license = {text = "MIT"}
+
+[project.scripts]
+lumina-read = "lumina.cli:main"
+
+[tool.maturin]
+python-source = "."
+module-name = "lumina.lumina_core"
+linker = "use-zig"
