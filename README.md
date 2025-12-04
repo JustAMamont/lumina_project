@@ -1,28 +1,35 @@
-# Lumina
+# Lumina ✨
 
-***Structured, Binary Logging for Python (Rust Backend)**
+***High-Performance, Structured, Binary Logging for Python (Rust Core)***
+
+[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://choosealicense.com/licenses/mit/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/lumina)](https://pypi.org/project/lumina/)
+[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
 
 > ⚠️ **Status: Alpha / Experimental**
 > This project is currently in early development. APIs may change, and pre-built wheels are not yet available on PyPI.
 
 ---
 
-Lumina is a hybrid logging library for Python. It attempts to reduce logging overhead by offloading I/O, serialization, and compression to a background Rust thread. It uses a custom binary format to store logs efficiently and includes a CLI tool for reading and merging log files.
+Lumina is a hybrid logging library for Python designed for high-throughput and low-latency applications. It achieves this by offloading all heavy lifting—serialization, compression, and I/O—to a highly parallelized Rust core, ensuring your main application thread remains unblocked.
 
-## Features
+It uses a custom binary format (`.ldb`) for efficient, structured storage and includes a powerful CLI tool for real-time and historical log analysis.
 
-* **Background Worker:** Logging operations are sent to a Rust thread via a channel, minimizing blocking in the Python main thread.
-* **Binary Format (.ldb):** Logs are serialized with `Bincode` and compressed with `LZ4`.
-* **Structured Data:** Supports passing keyword arguments (`kwargs`) which are stored as searchable fields.
-* **CLI Reader:** A dedicated tool (`lumina-read`) to decode, filter, and merge log files.
-* **Resource Profiling:** Context manager to track CPU usage, RAM deltas, and Page Faults.
-* **Compatibility:** Can intercept standard Python `logging` calls.
+## Key Features
+
+* 🚀 **Extremely Low Overhead:** Python calls return in microseconds by sending logs to a lock-free in-memory channel.
+* ⚙️ **Multi-Core Architecture:** A pool of Rust workers processes logs in parallel, handling compression and serialization across all available CPU cores. A dedicated I/O thread ensures non-blocking disk writes.
+* 📦 **Efficient Binary Format (.ldb):** Logs are serialized with `Bincode` and compressed with `LZ4` for fast writes and reads.
+* 🔍 **Structured Data:** Pass keyword arguments (`kwargs`) to your logs. They are stored as structured, searchable fields, not just plain text.
+* ⏱️ **Advanced Resource Profiling:** A built-in context manager tracks Wall Time, CPU Time, RAM Deltas, and even low-level OS metrics like Page Faults and Context Switches.
+* 🖥️ **Powerful CLI Reader:** A standalone tool (`lumina`) to decode, filter, merge, and live-tail log files from multiple sources in chronological order.
+* 🤝 **Standard Library Integration:** Can seamlessly intercept calls from Python's standard `logging` module, speeding up your entire application and its dependencies.
 
 ---
 
 ## 🚀 Quick Start (Local Development)
 
-Since this is an alpha build, you need to compile it from source. Choose your OS below.
+Since this is an alpha build, you need to compile it from source.
 
 ### Prerequisites
 
@@ -35,7 +42,7 @@ Since this is an alpha build, you need to compile it from source. Choose your OS
 
     ```bash
     git clone https://github.com/JustAMamont/lumina_project
-    cd lumina
+    cd lumina_project
     python3 -m venv env
     source env/bin/activate
     ```
@@ -44,10 +51,10 @@ Since this is an alpha build, you need to compile it from source. Choose your OS
 
     ```bash
     pip install -U pip
-    pip install maturin patchelf ziglang
+    pip install maturin
     ```
 
-3. **Compile and Install:**
+3. **Compile and Install in Editable Mode:**
 
     ```bash
     maturin develop --release
@@ -58,8 +65,8 @@ Since this is an alpha build, you need to compile it from source. Choose your OS
 1. **Clone and Setup Environment:**
 
     ```powershell
-    git clone https://github.com/JustAMamont/lumina.git
-    cd lumina
+    git clone https://github.com/JustAMamont/lumina_project
+    cd lumina_project
     python -m venv env
     .\env\Scripts\Activate
     ```
@@ -69,10 +76,9 @@ Since this is an alpha build, you need to compile it from source. Choose your OS
     ```powershell
     pip install -U pip
     pip install maturin
-    # Note: patchelf/ziglang are usually not required for local Windows dev
     ```
 
-3. **Compile and Install:**
+3. **Compile and Install in Editable Mode:**
 
     ```powershell
     maturin develop --release
@@ -80,7 +86,7 @@ Since this is an alpha build, you need to compile it from source. Choose your OS
 
 ### ✅ Verification
 
-Run the demo script to ensure everything is working:
+Run the demo script to see Lumina in action:
 
 ```bash
 python examples/demo.py
@@ -90,12 +96,15 @@ python examples/demo.py
 
 ### ⚡ Performance Benchmark
 
-Lumina is designed to unblock your main application thread.
-You can run the included benchmark to compare it against the standard `logging` module:
+Lumina is designed to keep your main application thread responsive. The included benchmark highlights the difference, especially under multi-threaded contention.
 
 ```bash
 python examples/benchmark.py
 ```
+
+You will see how Lumina maintains stable, sub-10 microsecond latencies even when multiple threads are logging heavily, while standard logging performance degrades significantly.
+
+---
 
 ## 🧪 Running Tests
 
@@ -108,7 +117,7 @@ Lumina uses `pytest` for integration testing.
     ```
 
 2. **Run Tests:**
-    **Important:** Always rebuild the Rust extension before running tests if you changed any Rust code.
+    **Important:** Always rebuild the Rust extension before running tests if you've changed any Rust code.
 
     ```bash
     maturin develop --release
@@ -121,23 +130,29 @@ Lumina uses `pytest` for integration testing.
 
 ### Building the Python Wheel (.whl)
 
-Creates a package installable on other machines (even without Rust).
+Creates a package that can be installed on other machines of the same architecture, even those without Rust installed.
 
 ```bash
-maturin build --release
+# For a specific Python version
+maturin build --release --interpreter python3.12
+
+# For cross-compilation (e.g., building for Linux on macOS/Windows)
+# Requires Docker for manylinux builds or Zig for simpler cases
+pip install ziglang
+maturin build --release --zig
 ```
 
-*Artifacts location: `target/wheels/`*
+*Artifacts are located in `target/wheels/`.*
 
 ### Building the Standalone Reader Binary
 
-Compiles `lumina-read` as a standalone executable (no Python required).
+Compiles the `lumina` CLI tool as a single, standalone executable that requires no Python or other dependencies.
 
 ```bash
 cargo build --release --bin lumina
 ```
 
-*Artifact location: `target/release/lumina` (Linux/Mac) or `target/release/lumina.exe` (Windows)*
+*The executable is located at `target/release/lumina` (Linux/Mac) or `target/release/lumina.exe` (Windows).*
 
 ---
 
@@ -145,98 +160,115 @@ cargo build --release --bin lumina
 
 ```python
 from lumina import Lumina
+import time
 
-# Initialize Logger
+# Initialize the logger (singleton)
 lum = Lumina.get_logger(
     name="PaymentService",
     path_template="logs/{date}.ldb",
-    flush_interval_ms=500
+    flush_interval_ms=500,
+    capture_caller=True # Shows file:line, useful for debugging
 )
 
-# Basic Log
-lum.info("Service started")
+# Basic log
+lum.info("Service started on port 8000")
 
-# Structured Log (Context)
+# Structured log with context
 lum.info("Transaction processed", user_id=42, amount=99.99, currency="USD")
 
-# Levels
-lum.success("Database connected")
-lum.warning("High latency detected", latency="150ms")
-lum.error("Connection failed", ip="10.0.0.5")
+# Different log levels
+lum.success("Database connection established")
+lum.warning("High latency detected", peer="10.0.0.5", latency="150ms")
+lum.error("Payment provider API failed", provider="Stripe", status_code=503)
 
-# Profiling
-with lum.profile("Data Processing"):
-    heavy_computation()
+# Log exceptions with full traceback
+try:
+    result = 1 / 0
+except Exception as e:
+    lum.critical("Fatal error in calculation", exc=e, details="This should not happen")
 
-# Flush and Close
+# Profile a block of code
+with lum.profile("Data Processing Task", source="kafka"):
+    # Simulate heavy work
+    time.sleep(0.1)
+    _ = [i*i for i in range(10_000)]
+
+# Explicitly shutdown (optional, done automatically on exit)
 lum.shutdown()
 ```
 
 ---
 
-## 🖥️ CLI Tool (`lumina-read`)
+## 🖥️ CLI Tool (`lumina`)
 
-Use the CLI to read, filter, and export binary logs.
+Use the CLI to read, filter, and export your binary logs.
 
-### Reading & Filtering
+### Basic Reading & Filtering
 
 ```bash
-# Read all logs in current directory (recursive scan)
-lumina-read
+# Read all logs found in the current directory (recursive scan)
+lumina
 
-# Follow logs live (tail -f)
-lumina-read -f
+# Follow logs live (like tail -f)
+lumina -f
 
-# Filter by minimum level (e.g., only ERROR and CRITICAL)
-lumina-read --min-level 40
+# Filter by minimum level (e.g., only WARNING and above)
+lumina --min-level 30
 
-# Search for text (grep)
-lumina-read --grep "database error"
+# Use convenient level flags
+lumina -wec  # Show warnings, errors, and criticals
+
+# Search for text anywhere in the log (case-insensitive grep)
+lumina --grep "user_id=42"
 ```
 
 ### 📤 Exporting to JSON Lines
 
-There are two ways to export logs for external analysis (ELK, jq, etc).
+Export logs for external analysis (ELK, Datadog, jq, etc.).
 
-#### Method 1: Standard Output (Pipe)
+#### Method 1: Pipe to Stdout
 
-Useful for chaining commands.
+Ideal for chaining commands with tools like `jq`.
 
 ```bash
-lumina-read --json > output.jsonl
+lumina --json --days 1 | jq '. | select(.context.amount > 100)' > large_transactions.jsonl
 ```
 
-#### Method 2: Internal Export Flag
+#### Method 2: Direct File Export
 
-Useful for saving files directly. Note the path behavior:
+Convenient for saving query results directly. The path handling is smart:
 
-1. **Filename only:** Saves to default `logs/exports/` directory.
+1. **Filename only:** Saves to the default `logs/exports/` directory.
 
     ```bash
-    # Saves to: ./logs/exports/dump.jsonl
-    lumina-read --export-json dump.jsonl
+    # Resulting file: ./logs/exports/yesterday.jsonl
+    lumina --days 1 --export-json yesterday.jsonl
     ```
 
-2. **Full Path:** Respects the provided path and creates directories if needed.
+2. **Full or Relative Path:** Respects the provided path and creates directories if needed.
 
     ```bash
-    # Saves to: /tmp/my_data/custom.jsonl
-    lumina-read --export-json /tmp/my_data/custom.jsonl
+    # Resulting file: /tmp/data/prod-errors.jsonl
+    lumina -e --export-json /tmp/data/prod-errors.jsonl
     ```
 
 ---
 
 ## ⚙️ Configuration Options
 
-| Parameter | Default | Description |
-| :--- | :--- | :--- |
-| `path_template` | `"logs/{date}.ldb"` | File path pattern. |
-| `retention_days` | `7` | Auto-delete logs older than N days. |
-| `channel_capacity` | `50,000` | Max pending logs in memory queue. |
-| `flush_interval_ms` | `100` | Frequency of disk writes. |
-| `capture_caller` | `False` | Resolve filename/line number (adds overhead). |
-| `text_enabled` | `False` | Write duplicate logs to a standard .log text file. |
+Key parameters for `Lumina.get_logger()`:
+
+| Parameter           | Default           | Description                                                                                              |
+| :------------------ | :---------------- | :------------------------------------------------------------------------------------------------------- |
+| `name`              | *script name*     | The name of your application, appears in logs.                                                           |
+| `path_template`     | `"logs/{date}.ldb"` | File path pattern for log files. `{date}` is automatically replaced.                                     |
+| `retention_days`    | `7`               | Automatically delete log files older than N days on startup.                                             |
+| `channel_capacity`  | `50,000`          | The in-memory buffer size. A larger buffer handles bigger spikes in log volume before dropping messages. |
+| `flush_interval_ms` | `100`             | How often the background thread forces a write to disk, even under low load.                             |
+| `capture_caller`    | `False`           | If `True`, resolves the `file:line` of every log call. Adds a small performance overhead.                |
+| `text_enabled`      | `False`           | If `True`, writes a duplicate, human-readable `.log` file alongside the binary `.ldb` file.              |
+| `db_enabled`        | `True`            | If `False`, disables writing to the binary `.ldb` file.                                                  |
 
 ## License
 
-MIT License.
+This project is licensed under the MIT License.

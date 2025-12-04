@@ -2,7 +2,6 @@ use pyo3::prelude::*;
 
 mod types;
 pub mod utils;
-mod drivers;
 mod engine;
 pub mod reader;
 

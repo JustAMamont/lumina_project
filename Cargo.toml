@@ -38,6 +38,7 @@ indexmap = { version = "2.2", features = ["serde"] }
 rustc-hash = "1.1"
 libc = "0.2" 
 memmap2 = "0.9.9"
+num_cpus = "1.16" 
 
 [profile.release]
 opt-level = 3       

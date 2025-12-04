@@ -114,6 +114,8 @@ class Lumina:
     def _shutdown(self):
         if hasattr(self, '_engine'):
             self._engine.terminate()
+            # Prevent multiple calls
+            delattr(self, '_engine')
 
     def shutdown(self):
         """Manually stops the logging engine and flushes pending logs."""
@@ -129,6 +131,8 @@ class Lumina:
                 sys.__excepthook__(exc_type, exc_value, exc_traceback)
                 return
             self.critical("Uncaught exception detected", exc=exc_value)
+            # Give a moment for the log to be written before the process terminates
+            time.sleep(0.2)
             
         sys.excepthook = handle_exception
 
@@ -172,6 +176,9 @@ class Lumina:
             capture_caller: If True, resolves file:line for every log (slower).
             theme: "dark" or "light".
         """
+        if cls._instance is not None:
+             # This is a soft-reconfiguration, not ideal for a true singleton but good for tests
+             pass
         return cls(name, path_template, retention_days, channel_capacity, 
                    file_buffer_size, ui_refresh_rate_ms, flush_interval_ms, 
                    text_enabled, db_enabled, capture_caller, colors_enabled, theme)

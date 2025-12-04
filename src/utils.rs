@@ -6,6 +6,9 @@ use std::sync::RwLock;
 use crate::types::Theme;
 use crossterm::terminal::size;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::thread;
 
 /// Regex to match custom style tags in the format `[text|style1+style2]`.
 static STYLE_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -156,4 +159,11 @@ pub fn get_level_meta(level: u8) -> (&'static str, ColoredString, &'static str) 
 pub fn sanitize_input(text: &str) -> String {
     let s = text.replace('\x1b', "^[");
     s.replace('\r', "\\r")
+}
+
+/// Helper to get a stable, hashed Thread ID for sharding.
+pub fn get_current_thread_hash() -> u64 {
+    let mut hasher = DefaultHasher::new();
+    thread::current().id().hash(&mut hasher);
+    hasher.finish()
 }

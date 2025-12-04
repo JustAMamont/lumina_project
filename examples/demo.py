@@ -178,3 +178,57 @@ if __name__ == "__main__":
     demo_exception()
     
     lum.success("🏁 Demo finished. Logs flushed to disk.")
+
+
+#============================================================
+#⚡ BENCHMARK: Application Responsiveness Test
+#   Measuring how long the main application thread is blocked by each log call.
+#   Lower numbers mean the application remains more responsive under load.
+#============================================================
+#
+#--- SCENARIO 1: SINGLE-THREADED LOGGING ---
+#   A single thread writing 400,000 log messages.
+#
+#============================================================
+#📋 RESULTS: SINGLE-THREADED MODE
+#
+#📊 STANDARD Logger STATISTICS (microseconds):
+#   Median (P50):   27.16 µs  (Typical latency)
+#   Tail   (P99):   40.57 µs  (1% slowest calls)
+#   Spike  (Max): 18189.22 µs  (The single worst pause)
+#
+#📊 LUMINA Logger STATISTICS (microseconds):
+#   Median (P50):    3.77 µs  (Typical latency)
+#   Tail   (P99):    7.61 µs  (1% slowest calls)
+#   Spike  (Max): 5168.93 µs  (The single worst pause)
+#
+#──────────────────── 🚀 PERFORMANCE GAIN ────────────────────
+#   Typical Speedup (P50): 7.2x faster
+#   Stability Gain (P99): 5.3x more stable (fewer spikes)
+#
+#✅ Lumina's impact is negligible. Main thread pauses are minimal.
+#============================================================
+#
+#--- SCENARIO 2: MULTI-THREADED LOGGING (CONTENTION) ---
+#   4 threads writing a total of 400,000 messages to the SAME file.
+#   This test shows how the logger handles contention and locking.
+#
+#============================================================
+#📋 RESULTS: MULTI-THREADED MODE (CONTENTION)
+#
+#📊 STANDARD Logger STATISTICS (microseconds):
+#   Median (P50):   37.78 µs  (Typical latency)
+#   Tail   (P99): 4104.31 µs  (1% slowest calls)
+#   Spike  (Max): 29234.91 µs  (The single worst pause)
+#
+#📊 LUMINA Logger STATISTICS (microseconds):
+#   Median (P50):    3.77 µs  (Typical latency)
+#   Tail   (P99):   14.74 µs  (1% slowest calls)
+#   Spike  (Max): 87876.70 µs  (The single worst pause)
+#
+#──────────────────── 🚀 PERFORMANCE GAIN ────────────────────
+#   Typical Speedup (P50): 10.0x faster
+#   Stability Gain (P99): 278.5x more stable (fewer spikes)
+#============================================================
+#
+#🏁 BENCHMARK COMPLETE

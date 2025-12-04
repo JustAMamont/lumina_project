@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use indexmap::IndexMap; 
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
@@ -37,7 +38,7 @@ pub struct RawTraceback {
     pub frames: Vec<TraceFrame>,
 }
 
-/// Internal log entry passed through the channel from Python to the Writer thread.
+/// Internal log entry passed through the channel from Python to the Workers.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub app_name: Arc<str>,
@@ -62,6 +63,26 @@ pub struct LogEntry {
     // Control flags
     pub signal_shutdown: bool,
 }
+
+/// A message sent from Workers to the Writer thread.
+/// Contains pre-processed binary blobs ready for disk I/O.
+pub enum WriterMsg {
+    /// A pre-compressed binary block for the .ldb file
+    BinaryBlock {
+        data: Vec<u8>,
+        target_path: PathBuf,
+    },
+    /// A pre-formatted text line for the .log file
+    TextLine {
+        line: String,
+        target_path: PathBuf,
+    },
+    /// Signal to flush all open file buffers
+    Flush,
+    /// Shutdown signal for the writer thread
+    Shutdown,
+}
+
 
 /// Compact record structure for binary storage on disk (Bincode/LZ4).
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -4,27 +4,37 @@ use std::thread::{self, JoinHandle};
 use std::collections::HashMap;
 use std::time::{Instant, Duration, SystemTime, UNIX_EPOCH};
 use std::hash::{Hash, Hasher};
-use crossbeam_channel::{bounded, Sender, TrySendError, RecvTimeoutError};
+use crossbeam_channel::{bounded, Sender, Receiver, RecvTimeoutError, TrySendError};
 use std::sync::Arc;
 use ahash::AHasher; 
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::io::{stdout, Write}; 
+use std::io::{stdout, Write, Seek, BufWriter}; 
 use std::env; 
-use std::path::Path; 
-use std::fs; 
+use std::path::{Path, PathBuf}; 
+use std::fs::{self, OpenOptions, File}; 
 use colored::*;
 use sysinfo::{Pid, System}; 
 use indexmap::IndexMap;
 use rustc_hash::FxHasher;
+use bincode::Options;
+use byteorder::{WriteBytesExt, LittleEndian};
+use crc32fast::Hasher as Crc32Hasher;
+use fs2::FileExt;
+use chrono::DateTime; 
 
 #[cfg(unix)]
 use libc::{getrusage, rusage, RUSAGE_SELF};
 
-use crate::types::{LogEntry, TraceFrame, CallerCache, Theme};
+use crate::types::{LogEntry, TraceFrame, CallerCache, Theme, WriterMsg, BinaryLogRecord, RawTraceback};
 use crate::utils::{get_time_parts, fast_colorize, get_level_meta, 
-    set_theme, measure_text_height, set_colors_enabled};
-use crate::drivers::{LogDriver, text::TextFileDriver, binary::LuminaDbDriver};
+    set_theme, measure_text_height, set_colors_enabled, get_current_thread_hash, sanitize_input, remove_style_tags};
+
+// === CONSTANTS ===
+const MAGIC_HEADER: &[u8; 4] = b"LUM1";
+const BINARY_BATCH_CAPACITY: usize = 1000;
+const TEXT_FILE_BUFFER_SIZE: usize = 256 * 1024;
+const BINARY_FILE_BUFFER_SIZE: usize = 256 * 1024;
 
 // === HELPER FUNCTIONS ===
 
@@ -50,13 +60,9 @@ fn find_caller_in_rust(py: Python, skip_frames: usize) -> Option<(String, u32)> 
         if let Ok(code) = f.getattr("f_code") {
             if let Ok(filename_py) = code.getattr("co_filename") {
                 let filename: String = filename_py.extract().unwrap_or_default();
-                
                 let mut is_skipped = false;
                 for marker in &skip_markers {
-                    if filename.contains(marker) {
-                        is_skipped = true;
-                        break;
-                    }
+                    if filename.contains(marker) { is_skipped = true; break; }
                 }
 
                 let path = Path::new(&filename);
@@ -64,9 +70,7 @@ fn find_caller_in_rust(py: Python, skip_frames: usize) -> Option<(String, u32)> 
                 let final_path = path.strip_prefix(&cwd).unwrap_or(path).to_string_lossy().to_string();
                 let lineno: u32 = f.getattr("f_lineno").ok().and_then(|l| l.extract().ok()).unwrap_or(0);
 
-                if !is_skipped {
-                    return Some((final_path, lineno));
-                }
+                if !is_skipped { return Some((final_path, lineno)); }
                 last_valid_frame_info = Some((final_path, lineno));
             }
         }
@@ -80,116 +84,21 @@ fn find_caller_in_rust(py: Python, skip_frames: usize) -> Option<(String, u32)> 
 fn format_ram_delta(delta: i64) -> String {
     let sign = if delta >= 0 { "+" } else { "-" };
     let val = delta.abs() as f64;
-    if val > 1024.0 * 1024.0 {
-        format!("{}{:.2}MB", sign, val / 1024.0 / 1024.0)
-    } else if val > 1024.0 {
-        format!("{}{:.2}KB", sign, val / 1024.0)
-    } else {
-        format!("{}{:.0}B", sign, val)
-    }
+    if val > 1024.0 * 1024.0 { format!("{}{:.2}MB", sign, val / 1024.0 / 1024.0) } 
+    else if val > 1024.0 { format!("{}{:.2}KB", sign, val / 1024.0) } 
+    else { format!("{}{:.0}B", sign, val) }
 }
 
 fn format_ram_abs(val: u64) -> String {
     format!("{:.1}MB", val as f64 / 1024.0 / 1024.0)
 }
 
-/// Updates the console output, handling rewriting previous lines if necessary.
-fn update_console(
-    entry: &LogEntry, repeat: usize, is_update: bool, first_ts: f64, 
-    time_prefix: &str, time_nsecs: u32, last_height: usize
-) -> usize {
-    if !entry.to_console { return 0; }
-    let (_, lvl_color, icon) = get_level_meta(entry.level);
-    let safe_msg_raw = crate::utils::sanitize_input(&entry.message);
-    let colored_msg = fast_colorize(&safe_msg_raw);
-    
-    let is_light = {
-        if let Ok(r) = crate::utils::CURRENT_THEME.read() { *r == Theme::Light } else { false }
-    };
-
-    let context_str = if let Some(ctx) = &entry.context {
-        let mut s = String::new();
-        for (k, v) in ctx {
-            let safe_v = crate::utils::sanitize_input(v);
-            if is_light {
-                s.push_str(&format!(" {}={}", k.black().dimmed(), safe_v.blue()));
-            } else {
-                s.push_str(&format!(" {}={}", k.dimmed(), safe_v.cyan()));
-            }
-        }
-        s
-    } else {
-        String::new()
-    };
-
-    let suffix = if repeat > 0 {
-        let diff = entry.timestamp - first_ts;
-        let time_fmt = if diff < 1.0 { format!("{:.0}ms", diff * 1000.0) } else { format!("{:.1}s", diff) };
-        if is_light {
-            format!(" (x{} │ {})", repeat + 1, time_fmt).black().dimmed().to_string()
-        } else {
-            format!(" (x{} │ {})", repeat + 1, time_fmt).yellow().dimmed().to_string()
-        }
-    } else { String::new() };
-
-    let time_display = if is_light {
-        format!("{}.{:03}", time_prefix, time_nsecs).black().dimmed()
-    } else {
-        format!("{}.{:03}", time_prefix, time_nsecs).cyan().dimmed()
-    };
-    
-    let header = format!("{} {} {: <9} │ {}{}{}", time_display, icon, lvl_color, colored_msg, context_str, suffix);
-    let mut stdout = stdout();
-    
-    let mut current_height = measure_text_height(&header);
-
-    if is_update {
-        if last_height > 0 {
-            let move_up = format!("\x1b[{}A", last_height);
-            let _ = write!(stdout, "{}", move_up);
-        } else { 
-            let _ = write!(stdout, "\x1b[1A"); 
-        }
-        let _ = write!(stdout, "\x1b[J");
-    }
-    let _ = writeln!(stdout, "{}", header);
-
-    if entry.exc_type.is_some() {
-        let mut tb_str = String::new();
-        if let Some(frames) = &entry.trace_frames {
-            let header = if is_light { "Traceback (most recent call last):".magenta().to_string() } 
-                         else { "Traceback (most recent call last):".yellow().dimmed().to_string() };
-            tb_str.push_str(&format!("{}\n", header));
-            // Limit frames in live console view to avoid spam and performance issues
-            for frame in frames.iter().take(5) {
-                 let fname = if is_light { frame.filename.blue().to_string() } else { frame.filename.blue().underline().to_string() };
-                 let line = if is_light { frame.lineno.to_string().purple().to_string() } else { frame.lineno.to_string().yellow().to_string() };
-                 let func = if is_light { frame.name.black().bold().to_string() } else { frame.name.cyan().to_string() };
-                 tb_str.push_str(&format!("  File \"{}\", line {}, in {}\n", fname, line, func));
-            }
-            if frames.len() > 5 {
-                tb_str.push_str(&format!("  ... ({} more frames)\n", frames.len() - 5));
-            }
-        }
-        let _ = write!(stdout, "{}", tb_str);
-        current_height += measure_text_height(&tb_str);
-        
-        if let (Some(t), Some(m)) = (&entry.exc_type, &entry.exc_message) {
-            let err_line = format!("{}: {}", t.red().bold(), m);
-            let _ = writeln!(stdout, "{}", err_line);
-            let _ = writeln!(stdout, "");
-            current_height += measure_text_height(&err_line) + 1;
-        }
-    }
-    let _ = stdout.flush();
-    current_height
-}
-
-/// Deletes log files older than `retention_days`.
 fn cleanup_old_logs(path_template: String, retention_days: u64) {
     if retention_days == 0 { return; }
     let path = Path::new(&path_template);
     let log_dir = match path.parent() { Some(p) if p.as_os_str().is_empty() => Path::new("."), Some(p) => p, None => return };
+    if !log_dir.exists() { return; }
+
     let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if let Ok(entries) = fs::read_dir(log_dir) {
         let now = SystemTime::now();
@@ -213,15 +122,104 @@ fn cleanup_old_logs(path_template: String, retention_days: u64) {
     }
 }
 
-/// The core engine of Lumina.
+
+static CONSOLE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(()); // Fixed: Added () for initialization
+
+fn update_console(
+    entry: &LogEntry, repeat: usize, is_update: bool, first_ts: f64, 
+    time_prefix: &str, time_nsecs: u32, last_height: &mut usize
+) {
+    if !entry.to_console { return; }
+    
+    let _guard = CONSOLE_LOCK.lock();
+
+    let (_, lvl_color, icon) = get_level_meta(entry.level);
+    let safe_msg_raw = sanitize_input(&entry.message);
+    let colored_msg = fast_colorize(&safe_msg_raw);
+    
+    let is_light = { if let Ok(r) = crate::utils::CURRENT_THEME.read() { *r == Theme::Light } else { false } };
+
+    let context_str = if let Some(ctx) = &entry.context {
+        let mut s = String::new();
+        for (k, v) in ctx {
+            let safe_v = sanitize_input(v);
+            if is_light { s.push_str(&format!(" {}={}", k.black().dimmed(), safe_v.blue())); } 
+            else { s.push_str(&format!(" {}={}", k.dimmed(), safe_v.cyan())); }
+        }
+        s
+    } else { String::new() };
+
+    let suffix = if repeat > 0 {
+        let diff = entry.timestamp - first_ts;
+        let time_fmt = if diff < 1.0 { format!("{:.0}ms", diff * 1000.0) } else { format!("{:.1}s", diff) };
+        if is_light { format!(" (x{} │ {})", repeat + 1, time_fmt).black().dimmed().to_string() } 
+        else { format!(" (x{} │ {})", repeat + 1, time_fmt).yellow().dimmed().to_string() }
+    } else { String::new() };
+
+    let time_display = if is_light { format!("{}.{:03}", time_prefix, time_nsecs).black().dimmed() } 
+    else { format!("{}.{:03}", time_prefix, time_nsecs).cyan().dimmed() };
+    
+    let header = format!("{} {} {: <9} │ {}{}{}", time_display, icon, lvl_color, colored_msg, context_str, suffix);
+    let mut stdout = stdout();
+    
+    let mut current_height = measure_text_height(&header);
+
+    if is_update {
+        if *last_height > 0 {
+            let move_up = format!("\x1b[{}A", *last_height);
+            let _ = write!(stdout, "{}", move_up);
+        } else { let _ = write!(stdout, "\x1b[1A"); }
+        let _ = write!(stdout, "\x1b[J");
+    }
+    let _ = writeln!(stdout, "{}", header);
+
+    if entry.exc_type.is_some() {
+        let mut tb_str = String::new();
+        if let Some(frames) = &entry.trace_frames {
+            let header = if is_light { "Traceback (most recent call last):".magenta().to_string() } 
+                         else { "Traceback (most recent call last):".yellow().dimmed().to_string() };
+            tb_str.push_str(&format!("{}\n", header));
+            for frame in frames.iter().take(5) {
+                 let fname = if is_light { frame.filename.blue().to_string() } else { frame.filename.blue().underline().to_string() };
+                 let line = if is_light { frame.lineno.to_string().purple().to_string() } else { frame.lineno.to_string().yellow().to_string() };
+                 let func = if is_light { frame.name.black().bold().to_string() } else { frame.name.cyan().to_string() };
+                 tb_str.push_str(&format!("  File \"{}\", line {}, in {}\n", fname, line, func));
+            }
+            if frames.len() > 5 { tb_str.push_str(&format!("  ... ({} more frames)\n", frames.len() - 5)); }
+        }
+        let _ = write!(stdout, "{}", tb_str);
+        current_height += measure_text_height(&tb_str);
+        
+        if let (Some(t), Some(m)) = (&entry.exc_type, &entry.exc_message) {
+            let err_line = format!("{}: {}", t.red().bold(), m);
+            let _ = writeln!(stdout, "{}", err_line);
+            let _ = writeln!(stdout, "");
+            current_height += measure_text_height(&err_line) + 1;
+        }
+    }
+    let _ = stdout.flush();
+    *last_height = current_height;
+}
+
+// === ENGINE ===
+
 #[pyclass]
 pub struct LuminaEngine {
-    tx: Sender<LogEntry>,
-    worker_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
+    // Sharded input channels. Python threads pick one based on their ThreadID.
+    input_shards: Vec<Sender<LogEntry>>,
+    
+    // Global writer channel. All workers send formatted blobs here.
+    writer_tx: Sender<WriterMsg>,
+    
+    // Handles to join threads on shutdown
+    worker_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    writer_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
+    
     last_push_exc_hash: Arc<AtomicU64>,
     dropped_logs_count: Arc<AtomicUsize>,
     caller_cache: Arc<Mutex<CallerCache>>,
     system_monitor: Arc<Mutex<System>>,
+    
     app_name: Arc<str>,
     capture_caller: bool,
     path_template: String,
@@ -234,7 +232,7 @@ impl LuminaEngine {
         app_name: String,
         cleanup_path_template: String,
         channel_capacity: usize, 
-        file_buffer_size: usize, 
+        _file_buffer_size: usize, // No longer used directly, writer has its own const
         console_refresh_rate: u128, 
         flush_interval_ms: u64, 
         text_enabled: bool, 
@@ -245,224 +243,73 @@ impl LuminaEngine {
         theme: Option<String>,
     ) -> Self {
         #[cfg(windows)] let _ = colored::control::set_virtual_terminal(true);
-        
         let theme_enum = Theme::from_str(&theme.unwrap_or_else(|| "dark".to_string()));
         set_theme(theme_enum);
         set_colors_enabled(colors_enabled);
 
         if retention_days > 0 {
-            let template_for_cleanup = cleanup_path_template.clone();
-            thread::spawn(move || { cleanup_old_logs(template_for_cleanup, retention_days); });
+            let tmpl = cleanup_path_template.clone();
+            thread::spawn(move || { cleanup_old_logs(tmpl, retention_days); });
+        }
+        
+        // Use at least 2 workers, but not more than 8 or num_cpus
+        let num_shards = num_cpus::get().min(8).max(2); 
+        let mut input_txs = Vec::with_capacity(num_shards);
+        let mut input_rxs = Vec::with_capacity(num_shards);
+        
+        for _ in 0..num_shards {
+            let shard_capacity = (channel_capacity as f64 / num_shards as f64).ceil() as usize;
+            let (tx, rx) = bounded::<LogEntry>(shard_capacity.max(1000));
+            input_txs.push(tx);
+            input_rxs.push(rx);
         }
 
-        let (tx, rx) = bounded::<LogEntry>(channel_capacity);
+        let (writer_tx, writer_rx) = bounded::<WriterMsg>(num_shards * 4);
         let dropped_logs_count = Arc::new(AtomicUsize::new(0));
-        let worker_dropped_count = dropped_logs_count.clone();
-
         let system_monitor = Arc::new(Mutex::new(System::new()));
+        
+        let mut handles = Vec::new();
+        
+        for i in 0..num_shards {
+            let rx = input_rxs.remove(0); // Take ownership
+            let w_tx = writer_tx.clone();
+            let dropped_c = dropped_logs_count.clone();
+            
+            let handle = thread::Builder::new()
+                .name(format!("lumina-worker-{}", i))
+                .spawn(move || {
+                    run_worker(
+                        rx, w_tx, 
+                        dropped_c, 
+                        text_enabled, db_enabled, 
+                        flush_interval_ms, console_refresh_rate
+                    );
+                }).expect("Failed to spawn worker");
+            handles.push(handle);
+        }
 
-        let worker_capacity = channel_capacity;
-        let worker_max_flush_ms = flush_interval_ms.max(1); 
-        const MIN_FLUSH_MS: u64 = 1; 
+        let writer_handle = thread::Builder::new()
+            .name("lumina-writer".to_string())
+            .spawn(move || {
+                run_writer(writer_rx);
+            }).expect("Failed to spawn writer");
 
+        // Send start signal to the first shard
         let start_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
-
         let app_name_arc: Arc<str> = app_name.clone().into();
         let start_msg = LogEntry {
-            app_name: app_name_arc.clone(),
-            timestamp: start_ts,
-            level: 20,
-            message: "🚀 Process started".to_string(),
-            path_template: cleanup_path_template.clone(),
-            to_console: false,
-            to_file: true,
-            rate_limit: 0.0, exc_type: None, exc_message: None, exc_hash: 0, trace_frames: None, 
-            context: None, context_hash: 0,
-            signal_shutdown: false
+            app_name: app_name_arc.clone(), timestamp: start_ts,
+            level: 20, message: "🚀 Process started".to_string(), path_template: cleanup_path_template.clone(),
+            to_console: false, to_file: true, rate_limit: 0.0, exc_type: None, exc_message: None, exc_hash: 0, 
+            trace_frames: None, context: None, context_hash: 0, signal_shutdown: false
         };
-        let _ = tx.send(start_msg);
-
-        // Spawn the worker thread
-        let handle = thread::Builder::new().name("lumina-worker".to_string()).spawn(move || {
-            let mut drivers: Vec<Box<dyn LogDriver>> = Vec::new();
-            if text_enabled { drivers.push(Box::new(TextFileDriver { writer: None, current_path: String::new(), buffer_size: file_buffer_size })); }
-            if db_enabled { drivers.push(Box::new(LuminaDbDriver::new())); }
-
-            let mut last_entry: Option<LogEntry> = None;
-            let mut last_valid_traceframes: Option<Vec<TraceFrame>> = None;
-            let mut last_valid_exc_hash: u64 = 0;
-            
-            let mut repeat_count: usize = 0;
-            let mut unflushed_repeats: usize = 0;
-            
-            let mut first_ts: f64 = 0.0;
-            let mut cached_ts_sec: i64 = 0;
-            let mut cached_ts_prefix: String = String::new();
-            let mut rate_limit_map: HashMap<u64, Instant, ahash::RandomState> = HashMap::default();
-            let mut last_console_update = Instant::now();
-            let mut skipped_console_update = false;
-            let mut last_overload_check = Instant::now();
-            let mut last_msg_height: usize = 0;
-            
-            let mut last_flush_time = Instant::now();
-
-            loop {
-                let current_occupancy = rx.len();
-                let effective_flush_interval = if current_occupancy == 0 {
-                    Duration::from_millis(worker_max_flush_ms)
-                } else {
-                    let ratio = current_occupancy as f64 / worker_capacity as f64;
-                    let dynamic_ms = if ratio > 0.8 { MIN_FLUSH_MS } else if ratio < 0.1 { worker_max_flush_ms } else {
-                        let effective_ratio = (ratio - 0.1) / 0.7;
-                        let range = worker_max_flush_ms.saturating_sub(MIN_FLUSH_MS);
-                        let reduction = (range as f64 * effective_ratio) as u64;
-                        worker_max_flush_ms.saturating_sub(reduction).max(MIN_FLUSH_MS)
-                    };
-                    Duration::from_millis(dynamic_ms)
-                };
-
-                let entry_result = rx.recv_timeout(effective_flush_interval);
-
-                match entry_result {
-                    Err(RecvTimeoutError::Timeout) => {
-                        if unflushed_repeats > 0 {
-                            if let Some(ref prev) = last_entry {
-                                let (prefix, nsecs) = get_time_parts(prev.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
-                                let count_arg = unflushed_repeats - 1;
-                                for d in &mut drivers { d.write(prev, count_arg, first_ts, prefix, nsecs); }
-                            }
-                            unflushed_repeats = 0; 
-                        }
-                        for d in &mut drivers { d.flush(); }
-                        last_flush_time = Instant::now(); 
-                        
-                        if let Some(ref current_entry) = last_entry {
-                            if current_entry.to_console && Instant::now().duration_since(last_console_update).as_millis() > console_refresh_rate {
-                                let (prefix, nsecs) = get_time_parts(current_entry.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
-                                last_msg_height = update_console(current_entry, repeat_count, true, first_ts, prefix, nsecs, last_msg_height);
-                                last_console_update = Instant::now();
-                            }
-                        }
-                        continue;
-                    },
-                    Err(RecvTimeoutError::Disconnected) => break,
-                    Ok(mut entry) => {
-                        if last_overload_check.elapsed().as_millis() > 1000 {
-                             let dropped = worker_dropped_count.swap(0, Ordering::Relaxed);
-                             if dropped > 0 {
-                                 if unflushed_repeats > 0 {
-                                     if let Some(prev) = last_entry.take() { 
-                                         let (prefix, nsecs) = get_time_parts(prev.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
-                                         let count_arg = unflushed_repeats - 1;
-                                         for d in &mut drivers { d.write(&prev, count_arg, first_ts, prefix, nsecs); }
-                                     }
-                                 }
-                                 unflushed_repeats = 0; repeat_count = 0; last_entry = None; 
-                             }
-                             last_overload_check = Instant::now();
-                        }
-
-                        if entry.signal_shutdown {
-                             if let Some(prev) = last_entry.take() { 
-                                 if unflushed_repeats > 0 {
-                                    let (prev_prefix, prev_nsecs) = get_time_parts(prev.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
-                                    if skipped_console_update && prev.to_console { 
-                                        update_console(&prev, repeat_count, true, first_ts, prev_prefix, prev_nsecs, last_msg_height); 
-                                    }
-                                    let count_arg = unflushed_repeats - 1;
-                                    for d in &mut drivers { d.write(&prev, count_arg, first_ts, prev_prefix, prev_nsecs); }
-                                 }
-                             }
-                             let stop_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
-                             let stop_msg = LogEntry {
-                                app_name: entry.app_name.clone(), timestamp: stop_ts, level: 20, message: "🛑 Process finished".to_string(),
-                                path_template: entry.path_template.clone(), to_console: false, to_file: true, 
-                                rate_limit: 0.0, exc_type: None, exc_message: None, exc_hash: 0, trace_frames: None, context: None, context_hash: 0, signal_shutdown: false
-                             };
-                             let (prefix, nsecs) = get_time_parts(stop_msg.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
-                             for d in &mut drivers { d.write(&stop_msg, 0, stop_msg.timestamp, prefix, nsecs); }
-                             for d in &mut drivers { d.flush(); }
-                             let _ = stdout().flush();
-                             break;
-                        }
-                        
-                        if entry.exc_hash != 0 {
-                            if entry.trace_frames.is_none() { 
-                                if entry.exc_hash == last_valid_exc_hash { entry.trace_frames = last_valid_traceframes.clone(); } 
-                            } else { last_valid_exc_hash = entry.exc_hash; last_valid_traceframes = entry.trace_frames.clone(); }
-                        }
-
-                        let mut skip_console = false;
-                        if entry.rate_limit > 0.0 {
-                            let mut hasher = AHasher::default(); entry.message.hash(&mut hasher); entry.level.hash(&mut hasher); entry.exc_hash.hash(&mut hasher);
-                            let msg_hash = hasher.finish(); let now = Instant::now();
-                            rate_limit_map.entry(msg_hash).and_modify(|last| { if now.duration_since(*last).as_secs_f64() < entry.rate_limit { skip_console = true; } else { *last = now; } }).or_insert(now);
-                        }
-                        if skip_console { entry.to_console = false; }
-                        
-                        let current_entry_to_console = entry.to_console;
-
-                        let is_duplicate = if let Some(ref last) = last_entry {
-                            last.level == entry.level && last.message == entry.message && last.exc_hash == entry.exc_hash && 
-                            last.app_name == entry.app_name && last.context_hash == entry.context_hash && current_entry_to_console == last.to_console 
-                        } else { false };
-
-                        if is_duplicate {
-                            repeat_count += 1; unflushed_repeats += 1;
-                            if let Some(ref mut last) = last_entry { last.timestamp = entry.timestamp; }
-                            let now = Instant::now();
-                            if now.duration_since(last_flush_time).as_millis() >= worker_max_flush_ms as u128 {
-                                if unflushed_repeats > 0 {
-                                    if let Some(ref prev) = last_entry { 
-                                        let (prefix, nsecs) = get_time_parts(prev.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
-                                        let count_arg = unflushed_repeats - 1;
-                                        for d in &mut drivers { d.write(prev, count_arg, first_ts, prefix, nsecs); }
-                                    }
-                                    unflushed_repeats = 0; 
-                                }
-                                for d in &mut drivers { d.flush(); }
-                                last_flush_time = now;
-                            }
-                            if current_entry_to_console && now.duration_since(last_console_update).as_millis() > console_refresh_rate {
-                                if let Some(ref current_entry) = last_entry { 
-                                    let (prefix, nsecs) = get_time_parts(current_entry.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
-                                    last_msg_height = update_console(current_entry, repeat_count, true, first_ts, prefix, nsecs, last_msg_height);
-                                    last_console_update = Instant::now(); skipped_console_update = false;
-                                }
-                            } else { skipped_console_update = true; }
-
-                        } else {
-                            if let Some(prev) = last_entry.take() { 
-                                let (prev_prefix, prev_nsecs) = get_time_parts(prev.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
-                                if unflushed_repeats > 0 {
-                                    let count_to_write = unflushed_repeats - 1;
-                                    for d in &mut drivers { d.write(&prev, count_to_write, first_ts, prev_prefix, prev_nsecs); }
-                                }
-                                if skipped_console_update && prev.to_console { 
-                                    update_console(&prev, repeat_count, true, first_ts, prev_prefix, prev_nsecs, last_msg_height); 
-                                }
-                                for d in &mut drivers { d.flush(); }
-                                last_flush_time = Instant::now();
-                            }
-                            
-                            repeat_count = 0; first_ts = entry.timestamp; 
-                            let (prefix, nsecs) = get_time_parts(entry.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
-
-                            if current_entry_to_console {
-                                last_msg_height = update_console(&entry, 0, false, first_ts, prefix, nsecs, 0);
-                                last_console_update = Instant::now(); skipped_console_update = false;
-                            } else { last_msg_height = 0; }
-                            
-                            last_entry = Some(entry); unflushed_repeats = 1; 
-                        }
-                    }
-                }
-            }
-        }).expect("Failed to spawn lumina worker");
+        let _ = input_txs[0].try_send(start_msg);
 
         LuminaEngine { 
-            tx, 
-            worker_thread: Arc::new(Mutex::new(Some(handle))), 
+            input_shards: input_txs,
+            writer_tx,
+            worker_threads: Arc::new(Mutex::new(handles)), 
+            writer_thread: Arc::new(Mutex::new(Some(writer_handle))),
             last_push_exc_hash: Arc::new(AtomicU64::new(0)), 
             dropped_logs_count, 
             caller_cache: Arc::new(Mutex::new(HashMap::new())), 
@@ -473,7 +320,6 @@ impl LuminaEngine {
         }
     }
 
-    /// Captures current system resources (CPU, RAM, Page Faults).
     fn snapshot_resources(&self) -> (f64, u64, u64, u64, u64, u64) {
         #[cfg(unix)]
         {
@@ -500,7 +346,6 @@ impl LuminaEngine {
         (0.0, 0, 0, 0, 0, 0)
     }
     
-    /// Calculates the difference between two snapshots and pushes a profile log entry.
     #[pyo3(signature = (name, start_data, end_data, t_start, t_end, min_duration_ms, slow_threshold_ms, console=true, tags=None))]
     fn push_profile(&self, py: Python<'_>, name: String, 
                     start_data: (f64, u64, u64, u64, u64, u64), 
@@ -615,10 +460,14 @@ impl LuminaEngine {
             context: Some(context), context_hash, signal_shutdown: false 
         };
         
-        let _ = self.tx.try_send(entry);
+        // Push logic
+        let thread_hash = get_current_thread_hash();
+        let idx = (thread_hash as usize) % self.input_shards.len();
+        if self.input_shards[idx].try_send(entry).is_err() {
+            self.dropped_logs_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    /// Pushes a standard log message to the queue.
     fn push(&self, py: Python<'_>, timestamp: f64, level: u8, mut message: String, path_template: String, 
             to_console: bool, to_file: bool, rate_limit: f64, exc: Option<&Bound<'_, PyAny>>, 
             context_dict: Option<&Bound<'_, PyDict>>, 
@@ -693,11 +542,18 @@ impl LuminaEngine {
             exc_type, exc_message, exc_hash, trace_frames, context, context_hash, signal_shutdown: false 
         };
         
-        match self.tx.try_send(entry) { Ok(_) => {}, Err(TrySendError::Full(_)) => { self.dropped_logs_count.fetch_add(1, Ordering::Relaxed); }, Err(_) => {} }
+        let thread_hash = get_current_thread_hash();
+        let idx = (thread_hash as usize) % self.input_shards.len();
+        
+        match self.input_shards[idx].try_send(entry) { 
+            Ok(_) => {}, 
+            Err(TrySendError::Full(_)) => { self.dropped_logs_count.fetch_add(1, Ordering::Relaxed); }, 
+            Err(_) => {} 
+        }
     }
 
     fn terminate(&self) {
-        let _ = self.tx.send(LogEntry { 
+        let shutdown_msg = LogEntry { 
             app_name: self.app_name.clone(), 
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
             level: 0, 
@@ -707,8 +563,340 @@ impl LuminaEngine {
             to_file: false, 
             rate_limit: 0.0, exc_type: None, exc_message: None, exc_hash: 0, trace_frames: None, context: None, context_hash: 0, 
             signal_shutdown: true 
-        });
-        let mut guard = self.worker_thread.lock();
-        if let Some(handle) = guard.take() { let _ = handle.join(); }
+        };
+
+        for tx in &self.input_shards {
+             let _ = tx.send(shutdown_msg.clone());
+        }
+
+        let mut workers_guard = self.worker_threads.lock();
+        for handle in workers_guard.drain(..) { 
+            let _ = handle.join(); 
+        }
+        
+        let _ = self.writer_tx.send(WriterMsg::Shutdown);
+        let mut writer_guard = self.writer_thread.lock();
+        if let Some(handle) = writer_guard.take() { 
+            let _ = handle.join(); 
+        }
     }
+}
+
+// === WORKER THREAD (Processor) ===
+fn run_worker(
+    rx: Receiver<LogEntry>,
+    writer_tx: Sender<WriterMsg>,
+    dropped_counter: Arc<AtomicUsize>,
+    text_enabled: bool,
+    db_enabled: bool,
+    flush_interval_ms: u64,
+    console_refresh_rate: u128,
+) {
+    let mut last_entry: Option<LogEntry> = None;
+    let mut last_valid_traceframes: Option<Vec<TraceFrame>> = None;
+    let mut last_valid_exc_hash: u64 = 0;
+    
+    let mut repeat_count: usize = 0;
+    
+    let mut first_ts: f64 = 0.0;
+    let mut cached_ts_sec: i64 = 0;
+    let mut cached_ts_prefix: String = String::new();
+    let mut rate_limit_map: HashMap<u64, Instant, ahash::RandomState> = HashMap::default();
+    
+    let mut last_console_update = Instant::now();
+    let mut last_msg_height: usize = 0;
+    let mut last_flush_time = Instant::now();
+
+    let mut binary_buffer: Vec<BinaryLogRecord> = Vec::with_capacity(BINARY_BATCH_CAPACITY);
+    let pid = std::process::id();
+
+    loop {
+        let timeout = Duration::from_millis(flush_interval_ms);
+        match rx.recv_timeout(timeout) {
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(last) = last_entry.take() {
+                    // Finalize the last entry before timeout-based flush
+                    if last.to_file {
+                        let (prefix, nsecs) = get_time_parts(last.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
+                        if text_enabled {
+                             let line = format_text_log(&last, repeat_count, first_ts, prefix, nsecs);
+                             let target_path = get_target_path(&last.path_template, last.timestamp, ".log");
+                             let _ = writer_tx.send(WriterMsg::TextLine { line, target_path });
+                        }
+                        if db_enabled {
+                             add_to_binary_buffer(&mut binary_buffer, &last, pid, repeat_count);
+                        }
+                    }
+                    if last.to_console {
+                        let (prefix, nsecs) = get_time_parts(last.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
+                        update_console(&last, repeat_count, true, first_ts, prefix, nsecs, &mut last_msg_height);
+                    }
+                    // Flush whatever is in the binary buffer
+                    if !binary_buffer.is_empty() {
+                        flush_binary_buffer(&mut binary_buffer, &last, &writer_tx);
+                    }
+                    let _ = writer_tx.send(WriterMsg::Flush);
+                    last_flush_time = Instant::now();
+                    last_entry = None;
+                    repeat_count = 0;
+                }
+                continue;
+            },
+            Err(RecvTimeoutError::Disconnected) => break,
+            Ok(mut entry) => {
+                if entry.signal_shutdown {
+                    if let Some(last) = last_entry.take() {
+                        finalize_and_flush(&last, repeat_count, &mut binary_buffer, &writer_tx, pid, text_enabled, db_enabled, &mut cached_ts_sec, &mut cached_ts_prefix, first_ts, &mut last_msg_height);
+                    }
+                    // Send a final "Process finished" message
+                    if db_enabled {
+                        let stop_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+                        let stop_msg = LogEntry {
+                            app_name: entry.app_name.clone(), timestamp: stop_ts, level: 20, message: "🛑 Process finished".to_string(),
+                            path_template: entry.path_template.clone(), to_console: false, to_file: true, 
+                            rate_limit: 0.0, exc_type: None, exc_message: None, exc_hash: 0, trace_frames: None, context: None, context_hash: 0, signal_shutdown: false
+                        };
+                        add_to_binary_buffer(&mut binary_buffer, &stop_msg, pid, 0);
+                        flush_binary_buffer(&mut binary_buffer, &stop_msg, &writer_tx);
+                    }
+                    break; 
+                }
+
+                if dropped_counter.load(Ordering::Relaxed) > 0 {
+                    let _ = dropped_counter.swap(0, Ordering::Relaxed);
+                    // Force flush and reset state on drop
+                    if let Some(last) = last_entry.take() {
+                        finalize_and_flush(&last, repeat_count, &mut binary_buffer, &writer_tx, pid, text_enabled, db_enabled, &mut cached_ts_sec, &mut cached_ts_prefix, first_ts, &mut last_msg_height);
+                    }
+                    repeat_count = 0;
+                }
+
+                if entry.exc_hash != 0 {
+                    if entry.trace_frames.is_none() { 
+                        if entry.exc_hash == last_valid_exc_hash { entry.trace_frames = last_valid_traceframes.clone(); } 
+                    } else { last_valid_exc_hash = entry.exc_hash; last_valid_traceframes = entry.trace_frames.clone(); }
+                }
+
+                if entry.rate_limit > 0.0 {
+                    let mut hasher = AHasher::default(); entry.message.hash(&mut hasher); entry.level.hash(&mut hasher);
+                    let msg_hash = hasher.finish();
+                    let now = Instant::now();
+                    if let Some(last_time) = rate_limit_map.get(&msg_hash) {
+                        if now.duration_since(*last_time).as_secs_f64() < entry.rate_limit {
+                            entry.to_console = false;
+                        } else {
+                            rate_limit_map.insert(msg_hash, now);
+                        }
+                    } else {
+                        rate_limit_map.insert(msg_hash, now);
+                    }
+                }
+
+                let is_dup = if let Some(ref last) = last_entry {
+                    last.level == entry.level && last.message == entry.message && last.exc_hash == entry.exc_hash && 
+                    last.app_name == entry.app_name && last.context_hash == entry.context_hash && entry.to_console == last.to_console 
+                } else { false };
+
+                if is_dup {
+                    repeat_count += 1;
+                    if let Some(ref mut last) = last_entry { last.timestamp = entry.timestamp; }
+                } else {
+                    if let Some(last) = last_entry.take() {
+                        finalize_and_flush(&last, repeat_count, &mut binary_buffer, &writer_tx, pid, text_enabled, db_enabled, &mut cached_ts_sec, &mut cached_ts_prefix, first_ts, &mut last_msg_height);
+                    }
+                    repeat_count = 0;
+                    
+                    first_ts = entry.timestamp;
+                    if entry.to_console {
+                        let (prefix, nsecs) = get_time_parts(entry.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
+                        update_console(&entry, 0, false, first_ts, prefix, nsecs, &mut last_msg_height);
+                        last_console_update = Instant::now(); 
+                    }
+                    last_entry = Some(entry);
+                }
+
+                if last_flush_time.elapsed().as_millis() >= flush_interval_ms as u128 || (db_enabled && binary_buffer.len() >= BINARY_BATCH_CAPACITY) {
+                     if let Some(ref log) = last_entry {
+                         flush_binary_buffer(&mut binary_buffer, log, &writer_tx);
+                         let _ = writer_tx.send(WriterMsg::Flush);
+                         last_flush_time = Instant::now();
+                     }
+                }
+                if let Some(ref last) = last_entry {
+                    if last.to_console && last_console_update.elapsed().as_millis() > console_refresh_rate {
+                         let (prefix, nsecs) = get_time_parts(last.timestamp, &mut cached_ts_sec, &mut cached_ts_prefix);
+                         update_console(last, repeat_count, true, first_ts, prefix, nsecs, &mut last_msg_height);
+                         last_console_update = Instant::now();
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Helper to bundle finalization logic for a log entry
+fn finalize_and_flush(
+    last: &LogEntry, 
+    repeats: usize, 
+    bin_buf: &mut Vec<BinaryLogRecord>, 
+    writer_tx: &Sender<WriterMsg>, 
+    pid: u32, 
+    text_enabled: bool, 
+    db_enabled: bool,
+    cached_ts_sec: &mut i64,
+    cached_ts_prefix: &mut String,
+    first_ts: f64,
+    last_msg_height: &mut usize
+) {
+    if last.to_file {
+        let (prefix, nsecs) = get_time_parts(last.timestamp, cached_ts_sec, cached_ts_prefix);
+        if text_enabled {
+            let line = format_text_log(last, repeats, first_ts, prefix, nsecs);
+            let target_path = get_target_path(&last.path_template, last.timestamp, ".log");
+            let _ = writer_tx.send(WriterMsg::TextLine { line, target_path });
+        }
+        if db_enabled {
+            add_to_binary_buffer(bin_buf, last, pid, repeats);
+        }
+    }
+    if last.to_console {
+        let (prefix, nsecs) = get_time_parts(last.timestamp, cached_ts_sec, cached_ts_prefix);
+        update_console(last, repeats, true, first_ts, prefix, nsecs, last_msg_height);
+    }
+    if db_enabled && !bin_buf.is_empty() {
+        flush_binary_buffer(bin_buf, last, writer_tx);
+    }
+}
+
+
+fn flush_binary_buffer(buf: &mut Vec<BinaryLogRecord>, last_log: &LogEntry, writer_tx: &Sender<WriterMsg>) {
+    if buf.is_empty() {
+        return;
+    }
+    let my_options = bincode::DefaultOptions::new().with_little_endian().with_fixint_encoding();
+    if let Ok(raw_data) = my_options.serialize(&buf) {
+        let compressed_data = lz4_flex::compress_prepend_size(&raw_data);
+        
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(&compressed_data);
+        let checksum = hasher.finalize();
+        let compressed_len = compressed_data.len() as u32;
+
+        let mut blob = Vec::with_capacity(8 + compressed_data.len());
+        let _ = blob.write_u32::<LittleEndian>(checksum);
+        let _ = blob.write_u32::<LittleEndian>(compressed_len);
+        blob.extend_from_slice(&compressed_data);
+
+        let target_path = get_target_path(&last_log.path_template, last_log.timestamp, ".ldb");
+        let _ = writer_tx.send(WriterMsg::BinaryBlock { data: blob, target_path });
+    }
+    buf.clear();
+}
+
+
+fn format_text_log(entry: &LogEntry, repeat: usize, first_ts: f64, time_prefix: &str, time_nsecs: u32) -> String {
+    let (lvl_str, _, _) = get_level_meta(entry.level);
+    let clean_msg = remove_style_tags(&entry.message);
+    let suffix = if repeat > 0 {
+        let diff = entry.timestamp - first_ts;
+        let time_fmt = if diff < 1.0 { format!("{:.0}ms", diff * 1000.0) } else { format!("{:.1}s", diff) };
+        format!(" (x{} | {})", repeat + 1, time_fmt)
+    } else { String::new() };
+
+    let mut out = format!("{}.{:03} | {} | {}{}\n", time_prefix, time_nsecs, lvl_str, clean_msg, suffix);
+    
+    if entry.exc_type.is_some() {
+        if let Some(frames) = &entry.trace_frames {
+            out.push_str("Traceback (most recent call last):\n");
+            for frame in frames {
+                out.push_str(&format!("  File \"{}\", line {}, in {}\n", frame.filename, frame.lineno, frame.name));
+            }
+        }
+        if let (Some(t), Some(m)) = (&entry.exc_type, &entry.exc_message) { 
+            out.push_str(&format!("{}: {}\n", t, m)); 
+        }
+    }
+    out
+}
+
+fn add_to_binary_buffer(buf: &mut Vec<BinaryLogRecord>, entry: &LogEntry, pid: u32, repeat: usize) {
+    let traceback = if let (Some(exc_type), Some(exc_message), Some(frames)) = 
+        (&entry.exc_type, &entry.exc_message, &entry.trace_frames) {
+        Some(RawTraceback { exc_type: exc_type.clone(), exc_message: exc_message.clone(), frames: frames.clone() })
+    } else { None };
+
+    buf.push(BinaryLogRecord {
+        ts: entry.timestamp, lvl: entry.level, app_name: entry.app_name.to_string(),
+        pid, msg: entry.message.clone(), traceback, context: entry.context.clone(),
+        count: (repeat + 1) as u32,
+    });
+}
+
+fn get_target_path(template: &str, timestamp: f64, desired_ext: &str) -> PathBuf {
+    let dt = DateTime::from_timestamp(timestamp as i64, 0).unwrap_or_default().with_timezone(&chrono::Local);
+    let date_str = dt.format("%Y-%m-%d").to_string();
+    let path_str = template.replace("{date}", &date_str);
+    let mut path = PathBuf::from(path_str);
+    path.set_extension(desired_ext.trim_start_matches('.'));
+    path
+}
+
+// === WRITER THREAD (I/O Only) ===
+fn run_writer(rx: Receiver<WriterMsg>) {
+    let mut file_map: HashMap<PathBuf, BufWriter<File>> = HashMap::new();
+    
+    loop {
+        match rx.recv() {
+            Ok(msg) => match msg {
+                WriterMsg::BinaryBlock { data, target_path } => {
+                    let writer = file_map.entry(target_path.clone()).or_insert_with(|| {
+                        open_writer(&target_path, true).unwrap() // Assume success for simplicity, add error handling
+                    });
+                    let _ = writer.write_all(&data);
+                },
+                WriterMsg::TextLine { line, target_path } => {
+                     let writer = file_map.entry(target_path.clone()).or_insert_with(|| {
+                        open_writer(&target_path, false).unwrap()
+                    });
+                    let _ = writer.write_all(line.as_bytes());
+                },
+                WriterMsg::Flush => {
+                    for w in file_map.values_mut() { let _ = w.flush(); }
+                },
+                WriterMsg::Shutdown => {
+                    for (_, mut writer) in file_map.drain() { 
+                        let _ = writer.flush();
+                        if let Ok(file) = writer.into_inner() {
+                            let _ = file.unlock();
+                        }
+                    }
+                    break;
+                }
+            },
+            Err(_) => break, // Channel disconnected
+        }
+    }
+}
+
+fn open_writer(path: &PathBuf, is_binary: bool) -> Result<BufWriter<File>, std::io::Error> {
+    if let Some(p) = path.parent() { 
+        if !p.exists() { 
+            fs::create_dir_all(p)?;
+        } 
+    }
+    
+    let file = OpenOptions::new().write(true).create(true).append(true).open(path)?;
+    
+    if file.try_lock_exclusive().is_err() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Could not lock file {:?}", path)));
+    }
+    
+    let buffer_size = if is_binary { BINARY_FILE_BUFFER_SIZE } else { TEXT_FILE_BUFFER_SIZE };
+    let mut writer = BufWriter::with_capacity(buffer_size, file);
+    
+    if is_binary && writer.stream_position()? == 0 {
+        writer.write_all(MAGIC_HEADER)?;
+    }
+    
+    Ok(writer)
 }
