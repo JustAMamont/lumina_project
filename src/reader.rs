@@ -597,3 +597,117 @@ fn color_by_name(name: &str) -> ColoredString {
         0 => name.cyan(), 1 => name.magenta(), 2 => name.green(), 3 => name.yellow(), 4 => name.blue(), _ => name.purple(),
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use crate::types::{BinaryLogRecord, LogEntry};
+    use crate::engine::flush_binary_buffer;
+    use crossbeam_channel::bounded;
+
+    fn write_test_file(path: &Path, records: Vec<BinaryLogRecord>) {
+        let (writer_tx, writer_rx) = bounded(10);
+        let path_str = path.to_str().unwrap().to_string();
+
+        let writer_thread = std::thread::spawn({
+            let path_clone = path.to_path_buf();
+            move || {
+                let mut file = OpenOptions::new().create(true).write(true).open(&path_clone).unwrap();
+                file.write_all(MAGIC_HEADER).unwrap();
+                for msg in writer_rx.iter() {
+                    if let crate::types::WriterMsg::BinaryBlock { data, .. } = msg {
+                        file.write_all(&data).unwrap();
+                    }
+                }
+            }
+        });
+
+        // The flush logic requires a LogEntry to know the target path.
+        let last_log = LogEntry {
+             app_name: "".into(), timestamp: 0.0, level: 0, message: "".to_string(),
+             path_template: path_str.clone(), to_console: false, to_file: true, rate_limit: 0.0,
+             exc_type: None, exc_message: None, exc_hash: 0, trace_frames: None, context: None, context_hash: 0, signal_shutdown: false,
+        };
+        
+        // We pass the records directly to flush_binary_buffer for this test setup.
+        let mut buf = records;
+        flush_binary_buffer(&mut buf, &last_log, &writer_tx);
+        drop(writer_tx); // Close the channel to unblock the writer thread.
+        writer_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_reader_scatter_gather_merge() {
+        let dir = tempdir().unwrap();
+        
+        // File 1 with interleaved timestamps.
+        let path1 = dir.path().join("proc1.ldb");
+        let records1 = vec![
+            BinaryLogRecord { ts: 100.0, msg: "p1_msg1".to_string(), count: 1, ..Default::default() },
+            BinaryLogRecord { ts: 300.0, msg: "p1_msg2".to_string(), count: 1, ..Default::default() },
+        ];
+        write_test_file(&path1, records1);
+
+        // File 2 with interleaved timestamps.
+        let path2 = dir.path().join("proc2.ldb");
+        let records2 = vec![
+            BinaryLogRecord { ts: 200.0, msg: "p2_msg1".to_string(), count: 1, ..Default::default() },
+            BinaryLogRecord { ts: 400.0, msg: "p2_msg2".to_string(), count: 1, ..Default::default() },
+        ];
+        write_test_file(&path2, records2);
+        
+        let export_path = dir.path().join("merged.json");
+        let pattern = dir.path().join("*.ldb").to_str().unwrap().to_string();
+        
+        let config = ReaderConfig {
+            file_pattern: Some(pattern),
+            export_json: Some(export_path.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        
+        run_reader_impl(config).unwrap();
+        
+        let result_json = fs::read_to_string(export_path).unwrap();
+        let records: Vec<serde_json::Value> = serde_json::from_str(&result_json).unwrap();
+        
+        assert_eq!(records.len(), 4, "There should be 4 records after merging");
+        
+        // Check for strict chronological order.
+        assert_eq!(records[0]["msg"], "p1_msg1");
+        assert_eq!(records[1]["msg"], "p2_msg1");
+        assert_eq!(records[2]["msg"], "p1_msg2");
+        assert_eq!(records[3]["msg"], "p2_msg2");
+        
+        let timestamps: Vec<f64> = records.iter().map(|r| r["ts"].as_f64().unwrap()).collect();
+        assert_eq!(timestamps, vec![100.0, 200.0, 300.0, 400.0]);
+    }
+    
+    // Add Default for BinaryLogRecord to simplify creation in tests.
+    impl Default for BinaryLogRecord {
+        fn default() -> Self {
+            Self {
+                ts: 0.0,
+                lvl: 20,
+                app_name: "default_app".to_string(),
+                pid: 0,
+                msg: "".to_string(),
+                traceback: None,
+                context: None,
+                count: 1,
+            }
+        }
+    }
+
+    // Default for ReaderConfig to simplify test setup.
+    impl Default for ReaderConfig {
+        fn default() -> Self {
+            Self {
+                file_pattern: None, min_level: 0, show_trace: false,
+                json_output: false, follow: false, target_levels: None,
+                grep: None, trace_type: None, start_ts: None, theme: None, export_json: None
+            }
+        }
+    }
+}

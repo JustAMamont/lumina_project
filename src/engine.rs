@@ -769,7 +769,7 @@ fn finalize_and_flush(
 }
 
 
-fn flush_binary_buffer(buf: &mut Vec<BinaryLogRecord>, last_log: &LogEntry, writer_tx: &Sender<WriterMsg>) {
+pub fn flush_binary_buffer(buf: &mut Vec<BinaryLogRecord>, last_log: &LogEntry, writer_tx: &Sender<WriterMsg>) {
     if buf.is_empty() {
         return;
     }
@@ -820,7 +820,7 @@ fn format_text_log(entry: &LogEntry, repeat: usize, first_ts: f64, time_prefix: 
     out
 }
 
-fn add_to_binary_buffer(buf: &mut Vec<BinaryLogRecord>, entry: &LogEntry, pid: u32, repeat: usize) {
+pub fn add_to_binary_buffer(buf: &mut Vec<BinaryLogRecord>, entry: &LogEntry, pid: u32, repeat: usize) {
     let traceback = if let (Some(exc_type), Some(exc_message), Some(frames)) = 
         (&entry.exc_type, &entry.exc_message, &entry.trace_frames) {
         Some(RawTraceback { exc_type: exc_type.clone(), exc_message: exc_message.clone(), frames: frames.clone() })
@@ -985,4 +985,166 @@ fn open_and_repair_writer(path: &PathBuf, is_binary: bool) -> Result<BufWriter<F
 
     let buffer_size = if is_binary { BINARY_FILE_BUFFER_SIZE } else { TEXT_FILE_BUFFER_SIZE };
     Ok(BufWriter::with_capacity(buffer_size, file))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
+    use crate::reader::{run_reader_impl, ReaderConfig};
+    use std::io::Write;
+
+    // Helper function is now updated to accept a path template.
+    fn create_test_entry(level: u8, message: &str, path_template: String) -> LogEntry {
+        LogEntry {
+            app_name: "test_app".into(),
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
+            level,
+            message: message.to_string(),
+            path_template, // Use the provided path template
+            to_console: false,
+            to_file: true,
+            rate_limit: 0.0,
+            exc_type: None,
+            exc_message: None,
+            exc_hash: 0,
+            trace_frames: None,
+            context: None,
+            context_hash: 0,
+            signal_shutdown: false,
+        }
+    }
+
+    #[test]
+    fn test_binary_format_integrity_and_repair() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("test.ldb");
+        // This path is now a concrete path like "/tmp/xyz/test.ldb"
+        let log_path_str = log_path.to_str().unwrap().to_string();
+
+        let (writer_tx, writer_rx) = bounded::<WriterMsg>(10);
+        
+        let writer_handle = thread::spawn(move || run_writer(writer_rx));
+
+        // --- Phase 1: Write a valid data block ---
+        let mut bin_buf = Vec::new();
+        // We pass the correct, concrete path to the log entry.
+        let entry1 = create_test_entry(20, "message 1", log_path_str.clone());
+        add_to_binary_buffer(&mut bin_buf, &entry1, 123, 0);
+        
+        // Send for writing. The writer will now use the correct path inside the temp directory.
+        flush_binary_buffer(&mut bin_buf, &entry1, &writer_tx);
+        writer_tx.send(WriterMsg::Flush).unwrap();
+        
+        // Sleep is still good practice to allow the OS scheduler to run the writer thread.
+        thread::sleep(Duration::from_millis(100));
+
+        // This check should now succeed because the writer wrote to the file we are checking.
+        let valid_size = fs::metadata(&log_path).unwrap().len();
+        assert!(valid_size > 4, "The file should contain more than just the header");
+
+        // --- Phase 2: Simulate file corruption ---
+        let mut file = OpenOptions::new().append(true).open(&log_path).unwrap();
+        file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        drop(file);
+        
+        let corrupted_size = fs::metadata(&log_path).unwrap().len();
+        assert_eq!(corrupted_size, valid_size + 4, "The file size should increase by 4 bytes of garbage");
+
+        // --- Phase 3: Re-open the file implicitly on the next write ---
+        let entry2 = create_test_entry(30, "message 2", log_path_str.clone());
+        add_to_binary_buffer(&mut bin_buf, &entry2, 123, 0);
+        
+        // This operation should trigger file check and repair on the correct file.
+        flush_binary_buffer(&mut bin_buf, &entry2, &writer_tx);
+        
+        // Shut down the writer to flush everything to disk.
+        writer_tx.send(WriterMsg::Shutdown).unwrap();
+        writer_handle.join().unwrap();
+
+        // --- Phase 4: Check the result ---
+        let repaired_size = fs::metadata(&log_path).unwrap().len();
+        assert!(repaired_size > valid_size, "The second block should have been written");
+    
+        let export_path = dir.path().join("export.json");
+        let config_export = ReaderConfig {
+            file_pattern: Some(log_path_str),
+            json_output: false,
+            export_json: Some(export_path.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+
+        run_reader_impl(config_export).unwrap();
+        
+        let result_json = fs::read_to_string(export_path).unwrap();
+        let records: Vec<serde_json::Value> = serde_json::from_str(&result_json).unwrap();
+        
+        assert_eq!(records.len(), 2, "Exactly 2 records should be read");
+        assert_eq!(records[0]["msg"], "message 1");
+        assert_eq!(records[1]["msg"], "message 2");
+    }
+
+    #[test]
+    fn test_worker_deduplication() {
+        let (tx, rx) = bounded::<LogEntry>(100);
+        let (writer_tx, writer_rx) = bounded::<WriterMsg>(10);
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        let worker_handle = thread::spawn(move || {
+            run_worker(rx, writer_tx, dropped, false, true, 1000, 100);
+        });
+        
+        // This test doesn't write to the filesystem, so a dummy path is fine.
+        let template = "logs/dedup_test.ldb".to_string();
+
+        // Send 3 identical messages.
+        let entry1 = create_test_entry(20, "repeated message", template.clone());
+        tx.send(entry1.clone()).unwrap();
+        tx.send(entry1.clone()).unwrap();
+        tx.send(entry1.clone()).unwrap();
+
+        // Send a different message to "reset" the deduplication state.
+        let entry2 = create_test_entry(30, "unique message", template.clone());
+        tx.send(entry2.clone()).unwrap();
+        
+        // Send a termination signal.
+        let mut shutdown_msg = create_test_entry(0, "", template.clone());
+        shutdown_msg.signal_shutdown = true;
+        tx.send(shutdown_msg).unwrap();
+
+        worker_handle.join().unwrap();
+        
+        // Collect results from the writer's channel.
+        let results: Vec<WriterMsg> = writer_rx.try_iter().collect();
+
+        let mut total_records = Vec::new();
+        for msg in results {
+            if let WriterMsg::BinaryBlock { data, .. } = msg {
+                 // Unpack the binary block to check its contents.
+                 let checksum = LittleEndian::read_u32(&data[0..4]);
+                 let len = LittleEndian::read_u32(&data[4..8]) as usize;
+                 let compressed = &data[8..8+len];
+
+                 let mut hasher = Crc32Hasher::new();
+                 hasher.update(compressed);
+                 assert_eq!(hasher.finalize(), checksum, "CRC32 checksum mismatch");
+                 
+                 let raw = lz4_flex::decompress_size_prepended(compressed).unwrap();
+                 let my_options = bincode::DefaultOptions::new().with_little_endian().with_fixint_encoding();
+                 let records: Vec<BinaryLogRecord> = my_options.deserialize(&raw).unwrap();
+                 total_records.extend(records);
+            }
+        }
+        
+        // Expecting at least 2 records: one with count=3, another with count=1.
+        assert!(total_records.len() >= 2, "At least 2 records are expected");
+        
+        let first_record = total_records.iter().find(|r| r.msg == "repeated message").unwrap();
+        assert_eq!(first_record.count, 3, "The counter for the repeated message should be 3");
+        
+        let second_record = total_records.iter().find(|r| r.msg == "unique message").unwrap();
+        assert_eq!(second_record.count, 1, "The counter for the unique message should be 1");
+    }
 }
