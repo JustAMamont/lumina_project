@@ -123,7 +123,7 @@ fn cleanup_old_logs(path_template: String, retention_days: u64) {
 }
 
 
-static CONSOLE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(()); // Fixed: Added () for initialization
+static CONSOLE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn update_console(
     entry: &LogEntry, repeat: usize, is_update: bool, first_ts: f64, 
@@ -852,6 +852,7 @@ fn run_writer(rx: Receiver<WriterMsg>) {
                     let mut writer_opt = file_map.get_mut(&target_path);
                     
                     // RETRY LOGIC for Binary
+                    // If the file is not already open, try to open it multiple times
                     if writer_opt.is_none() {
                         for i in 0..5 {
                             match open_writer(&target_path, true) {
@@ -861,9 +862,11 @@ fn run_writer(rx: Receiver<WriterMsg>) {
                                     break;
                                 },
                                 Err(e) => {
+                                    // If this was the last attempt, log the failure to stderr
                                     if i == 4 {
                                         eprintln!("🔥 Lumina IO Error: Failed to open/lock {:?} after 5 attempts: {}", target_path, e);
                                     } else {
+                                        // Wait a bit before retrying
                                         thread::sleep(Duration::from_millis(20));
                                     }
                                 }
@@ -872,7 +875,7 @@ fn run_writer(rx: Receiver<WriterMsg>) {
                     }
 
                     if let Some(writer) = writer_opt {
-                        // Ignore write errors to avoid panic
+                        // Ignore write errors to avoid panic (keep the thread alive)
                         let _ = writer.write_all(&data);
                     }
                 },

@@ -1,16 +1,23 @@
+// Only import PyO3 if we are building the Python extension
+#[cfg(feature = "extension-module")]
 use pyo3::prelude::*;
 
-mod types;
+pub mod types;
 pub mod utils;
-mod engine;
 pub mod reader;
 
-use engine::LuminaEngine;
-use reader::read_binary_log; 
+// The engine contains all the Python interaction logic.
+// We exclude it from the standalone binary build to prevent linking errors.
+#[cfg(feature = "extension-module")]
+mod engine;
 
-/// The Lumina Core Python module.
+// The module initialization function is only needed for Python
+#[cfg(feature = "extension-module")]
 #[pymodule]
 fn lumina_core(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    use engine::LuminaEngine;
+    use reader::read_binary_log; 
+    
     m.add_class::<LuminaEngine>()?;
     m.add_function(wrap_pyfunction!(read_binary_log, m)?)?;
     Ok(())

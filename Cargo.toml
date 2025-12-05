@@ -11,9 +11,15 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "lumina"
 path = "src/main.rs"
+required-features = []
+
+[features]
+default = ["extension-module"]
+extension-module = ["dep:pyo3", "pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.21.2", features = ["extension-module"] }
+pyo3 = { version = "0.21.2", optional = true }
+
 chrono = "0.4.31"
 crossbeam-channel = "0.5"
 colored = "2.1"

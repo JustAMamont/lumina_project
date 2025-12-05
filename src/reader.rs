@@ -1,4 +1,7 @@
+// Only import PyO3 types if building the extension
+#[cfg(feature = "extension-module")]
 use pyo3::prelude::*;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write, stdout, Stdout, IsTerminal};
 use byteorder::{ReadBytesExt, LittleEndian};
@@ -19,12 +22,10 @@ use crossterm::{cursor::MoveUp, terminal::{Clear, ClearType}, ExecutableCommand}
 use crate::utils::{fast_colorize, get_level_meta, set_theme, measure_text_height, remove_style_tags};
 use crate::types::{BinaryLogRecord, JsonLogRecord, Theme, RawTraceback, FileCache};
 
-/// Magic header to identify valid Lumina binary logs.
 const MAGIC_HEADER: &[u8; 4] = b"LUM1";
-const FILE_BUFFER_SIZE: usize = 128 * 1024; // 128KB Read Buffer
-const STDOUT_BUFFER_SIZE: usize = 128 * 1024; // 128KB Write Buffer
+const FILE_BUFFER_SIZE: usize = 128 * 1024; 
+const STDOUT_BUFFER_SIZE: usize = 128 * 1024; 
 
-/// Configuration object for the Log Reader.
 #[derive(Clone)]
 pub struct ReaderConfig {
     pub file_pattern: Option<String>,
@@ -40,7 +41,6 @@ pub struct ReaderConfig {
     pub export_json: Option<String>,
 }
 
-/// Helper struct for the Priority Queue (BinaryHeap).
 struct HeapEntry {
     record: BinaryLogRecord,
     file_idx: usize,
@@ -60,7 +60,6 @@ impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering { self.partial_cmp(other).unwrap_or(Ordering::Equal) }
 }
 
-/// Iterator that reads a single `.ldb` file block by block.
 struct SingleFileIterator {
     reader: BufReader<File>,
     buffer: std::vec::IntoIter<BinaryLogRecord>,
@@ -167,7 +166,8 @@ impl SingleFileIterator {
     }
 }
 
-// === Python Wrapper ===
+// === Python Wrapper (Only compiled for extension) ===
+#[cfg(feature = "extension-module")]
 #[pyfunction]
 #[pyo3(signature = (file_pattern_arg=None, min_level=0, show_trace=false, json_output=false,
     follow=false, target_levels=None, grep=None, trace_type=None, start_ts=None, theme=None,
@@ -208,7 +208,7 @@ pub fn read_binary_log(
     }
 }
 
-// === Pure Rust Implementation ===
+// === Pure Rust Implementation (Compiled for both) ===
 pub fn run_reader_impl(config: ReaderConfig) -> Result<(), Box<dyn std::error::Error>> {
     
     let theme_enum = Theme::from_str(&config.theme.clone().unwrap_or_else(|| "dark".to_string()));
@@ -238,6 +238,9 @@ pub fn run_reader_impl(config: ReaderConfig) -> Result<(), Box<dyn std::error::E
     let mut iterators: Vec<Option<SingleFileIterator>> = Vec::new();
     let mut heap = BinaryHeap::new();
     let mut known_paths: HashSet<PathBuf> = HashSet::new();
+    
+    // Counter to track if we actually showed anything
+    let mut logs_displayed_count = 0; 
 
     let scan_files = |iters: &mut Vec<Option<SingleFileIterator>>, h: &mut BinaryHeap<HeapEntry>, paths_set: &mut HashSet<PathBuf>| {
         let mut candidates = Vec::new();
@@ -253,25 +256,14 @@ pub fn run_reader_impl(config: ReaderConfig) -> Result<(), Box<dyn std::error::E
                  for entry in paths { if let Ok(p) = entry { if p.is_file() { candidates.push(p); } } }
              }
         }
-        
-        if candidates.is_empty() && config.file_pattern.is_none() {
-             let now = Local::now();
-             let current_date = now.date_naive();
-             let start_date = if let Some(ts) = config.start_ts {
-                 let secs = ts as i64;
-                 DateTime::from_timestamp(secs, 0).map(|d| d.with_timezone(&Local).date_naive()).unwrap_or(current_date)
-             } else { current_date };
-             let mut d = start_date;
-             while d <= current_date {
-                 let fname = format!("logs/{}.ldb", d.format("%Y-%m-%d"));
-                 let p = PathBuf::from(fname);
-                 if p.exists() { candidates.push(p); }
-                 if let Some(next_d) = d.succ_opt() { d = next_d; } else { break; }
-             }
-        }
 
         for path in candidates {
             if !paths_set.contains(&path) {
+                // Debug info if not in JSON/Follow mode
+                if !config.json_output && !config.follow {
+                    eprintln!("📄 Found log file: {:?}", path); 
+                }
+                
                 if let Some(mut iter) = SingleFileIterator::new(path.to_str().unwrap(), &config) {
                     let file_idx = iters.len();
                     if let Some(first) = iter.next_rec() { h.push(HeapEntry { record: first, file_idx }); }
@@ -283,7 +275,11 @@ pub fn run_reader_impl(config: ReaderConfig) -> Result<(), Box<dyn std::error::E
     };
 
     scan_files(&mut iterators, &mut heap, &mut known_paths);
-    if known_paths.is_empty() && !config.follow { if !config.json_output { eprintln!("⚠️ No log files found."); } return Ok(()); }
+    
+    if known_paths.is_empty() && !config.follow { 
+        if !config.json_output { eprintln!("⚠️ No log files found in current directory/subdirectories."); } 
+        return Ok(()); 
+    }
 
     let mut file_cache: FileCache = HashMap::new();
     let mut pending_record: Option<BinaryLogRecord> = None;
@@ -310,14 +306,15 @@ pub fn run_reader_impl(config: ReaderConfig) -> Result<(), Box<dyn std::error::E
                 if !content.to_lowercase().contains(term) { show = false; }
             }
             if let Some(tf) = &type_filter {
-                if let Some(tb) = &rec.traceback {
+                 if let Some(tb) = &rec.traceback {
                     if !tb.exc_type.to_lowercase().contains(tf) { show = false; }
                 } else { show = false; }
             }
 
             if !show { continue; }
 
-            // CORRECTED LOGIC BLOCK
+            logs_displayed_count += 1;
+
             let is_duplicate = if let Some(pending) = &pending_record {
                 pending.lvl == rec.lvl && pending.msg == rec.msg && pending.traceback.is_none() && rec.traceback.is_none() && pending.app_name == rec.app_name && pending.context == rec.context
             } else {
@@ -325,40 +322,28 @@ pub fn run_reader_impl(config: ReaderConfig) -> Result<(), Box<dyn std::error::E
             };
 
             if is_duplicate {
-                // If the new record is a duplicate, just update the pending record's state.
                 if let Some(pending) = pending_record.as_mut() {
                     pending.count += rec.count;
                     pending.ts = rec.ts;
-                    // If we're in interactive follow mode, update the screen in-place.
                     if is_tty_follow {
                         last_height = print_entry(&mut stdout_handle, pending, &config, true, last_height, pending_first_ts, &mut file_cache);
                         let _ = stdout_handle.flush();
                     }
                 }
             } else {
-                // If it's a new, unique record:
-                // 1. Finalize and export the *previous* pending record, if it existed.
                 if let Some(finalized_pending) = pending_record.take() {
                     export_record(&finalized_pending, &mut json_writer, &mut is_first_export_record);
                 }
-
-                // 2. The new record becomes the pending one.
                 pending_first_ts = rec.ts;
-                
-                // 3. Print the new record on a new line. `is_update` is false.
                 last_height = print_entry(&mut stdout_handle, &rec, &config, false, 0, pending_first_ts, &mut file_cache);
                 let _ = stdout_handle.flush();
-                
-                // 4. Store it as the new pending record.
                 pending_record = Some(rec);
             }
 
         } else {
-            // Heap is empty, which means we've processed all historical logs.
             if !config.follow { break; }
             if !running.load(AtomicOrdering::SeqCst) { break; }
             
-            // In follow mode, actively look for new records.
             let mut got_new_data = false;
             for (idx, iter_opt) in iterators.iter_mut().enumerate() {
                 if let Some(iter) = iter_opt {
@@ -374,16 +359,13 @@ pub fn run_reader_impl(config: ReaderConfig) -> Result<(), Box<dyn std::error::E
                 last_rescan = Instant::now();
             }
 
-            // If after checking all files and rescanning we still have no new data, sleep.
             if !got_new_data && heap.is_empty() {
                 thread::sleep(Duration::from_millis(100));
             }
         }
     }
     
-    // Final print/export for the last pending record when the loop exits (e.g., via Ctrl+C).
     if let Some(last) = pending_record.take() {
-        // If it was being updated interactively, we need to print its final state.
         if is_tty_follow && last.count > 1 {
             print_entry(&mut stdout_handle, &last, &config, true, last_height, pending_first_ts, &mut file_cache);
         }
@@ -399,6 +381,13 @@ pub fn run_reader_impl(config: ReaderConfig) -> Result<(), Box<dyn std::error::E
             write!(w, "]")?;
         }
         let _ = w.flush();
+    }
+
+    if logs_displayed_count == 0 && !config.json_output && !config.follow {
+        eprintln!("\n⚠️  Found {} files, but 0 records matched your filters.", known_paths.len());
+        if config.start_ts.is_some() {
+            eprintln!("   Hint: Try removing time filters (-m/-H/-D) or ensure logs were written recently.");
+        }
     }
 
     Ok(())
@@ -515,7 +504,6 @@ fn print_entry(
         return 1;
     }
 
-    // Determine if we should move the cursor up. This only happens in interactive follow mode when updating a line.
     let is_tty_follow_update = std::io::stdout().is_terminal() && config.follow && is_update;
 
     if is_tty_follow_update && last_height > 0 {
@@ -525,10 +513,8 @@ fn print_entry(
     
     let content_height = print_record_content(writer, rec, config.show_trace, first_ts, file_cache);
     
-    // Always add a newline after printing a record's content to finalize the line.
     let _ = writeln!(writer);
     
-    // The height for the next potential update is the height of the content plus the final newline.
     content_height + 1
 }
 
@@ -583,12 +569,10 @@ fn print_record_content(
     let header_line = format!("{} │ {: <14} {: <9} │ {}{}{}", 
         time_colored, format!("[{}]", app_colored), lvl_color, colored_msg, context_str, suffix
     );
-    // Use write! here, as the final newline is handled by the calling function `print_entry`
     let _ = write!(writer, "{}", header_line);
     let mut current_height = measure_text_height(&header_line);
 
     if let Some(tb) = &rec.traceback {
-        // Add a newline to separate the main log from the traceback
         let _ = writeln!(writer);
         current_height += 1;
         if show_trace {

@@ -3,13 +3,12 @@ name: Lumina Cross-Platform Build
 on:
   push:
     branches: [ "main", "master" ]
-    # Запускать только при изменении кода или конфигов
     paths:
       - 'src/**'
       - 'Cargo.toml'
       - 'pyproject.toml'
       - '.github/workflows/lumina_cross_platform.yml'
-  workflow_dispatch: # Позволяет запустить сборку вручную кнопкой из интерфейса GitHub
+  workflow_dispatch:
 
 jobs:
   build:
@@ -22,11 +21,8 @@ jobs:
           # === LINUX ===
           - os: ubuntu-latest
             platform: linux
-            # Имя бинарника, которое создает cargo (из Cargo.toml [[bin]] name="lumina")
             cargo_bin_name: lumina
-            # Итоговое имя для удобства
             final_bin_name: lumina-read-linux
-            # Флаги для maturin (используем Zig для manylinux совместимости)
             maturin_args: "--zig"
           
           # === WINDOWS ===
@@ -34,7 +30,6 @@ jobs:
             platform: windows
             cargo_bin_name: lumina.exe
             final_bin_name: lumina-read-windows.exe
-            # На Windows Zig не нужен, используем родной MSVC
             maturin_args: ""
           
           # === MACOS (Apple Silicon) ===
@@ -42,67 +37,50 @@ jobs:
             platform: macos
             cargo_bin_name: lumina
             final_bin_name: lumina-read-macos
-            # На Mac используем родной Clang
             maturin_args: ""
 
     steps:
-    # 1. Скачиваем код
     - uses: actions/checkout@v4
 
-    # 2. Устанавливаем Python 3.12
     - name: Set up Python 3.12
       uses: actions/setup-python@v5
       with:
         python-version: "3.12"
 
-    # 3. Устанавливаем Rust (Cargo)
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
 
-    # 4. Устанавливаем инструменты сборки (Maturin, Zig)
-    # Используем bash shell даже на Windows для совместимости команд
     - name: Install Build Tools
       shell: bash
       run: |
         python -m pip install --upgrade pip
-        
-        # Устанавливаем maturin и ziglang (Zig нужен для Linux сборки wheel)
         pip install maturin ziglang
         
-        # Patchelf нужен только для Linux (исправляет пути в библиотеках)
         if [ "${{ matrix.platform }}" == "linux" ]; then
           pip install patchelf
         fi
 
-    # 5. Сборка Python библиотеки (.whl)
-    # Это аналог вашего `maturin build --release --zig`
     - name: Build Python Wheel
       shell: bash
       run: |
         maturin build --release ${{ matrix.maturin_args }} --out dist
 
-    # 6. Сборка Rust Бинарника (Ридер)
-    # Это аналог вашего `cargo build --release`
     - name: Build Rust Binary
       shell: bash
       run: |
-        # Собираем бинарник, указанный в Cargo.toml [[bin]] name="lumina"
-        cargo build --release --bin lumina
+        # --no-default-features disables the "extension-module" (PyO3) feature
+        # This prevents linking errors on macOS and produces a standalone binary
+        cargo build --release --bin lumina --no-default-features
 
-    # 7. Подготовка артефактов
-    # Перемещаем бинарник к wheel-файлу и переименовываем его
     - name: Prepare Artifacts
       shell: bash
       run: |
-        # Путь, куда Cargo положил бинарник
         SRC_BIN="target/release/${{ matrix.cargo_bin_name }}"
-        # Путь, куда мы хотим его положить (в папку dist к wheel файлу)
         DST_BIN="dist/${{ matrix.final_bin_name }}"
         
         echo "Moving $SRC_BIN to $DST_BIN"
         cp "$SRC_BIN" "$DST_BIN"
 
-    # 8. Загрузка результата в GitHub Actions
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
