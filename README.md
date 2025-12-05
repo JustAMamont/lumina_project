@@ -2,10 +2,6 @@
 
 ***High-Performance, Structured, Binary Logging for Python (Rust Core)***
 
-[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://choosealicense.com/licenses/mit/)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/lumina)](https://pypi.org/project/lumina/)
-[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
-
 > ⚠️ **Status: Alpha / Experimental**
 > This project is currently in early development. APIs may change, and pre-built wheels are not yet available on PyPI.
 
