@@ -849,16 +849,59 @@ fn run_writer(rx: Receiver<WriterMsg>) {
         match rx.recv() {
             Ok(msg) => match msg {
                 WriterMsg::BinaryBlock { data, target_path } => {
-                    let writer = file_map.entry(target_path.clone()).or_insert_with(|| {
-                        open_writer(&target_path, true).unwrap() // Assume success for simplicity, add error handling
-                    });
-                    let _ = writer.write_all(&data);
+                    let mut writer_opt = file_map.get_mut(&target_path);
+                    
+                    // RETRY LOGIC for Binary
+                    if writer_opt.is_none() {
+                        for i in 0..5 {
+                            match open_writer(&target_path, true) {
+                                Ok(w) => {
+                                    file_map.insert(target_path.clone(), w);
+                                    writer_opt = file_map.get_mut(&target_path);
+                                    break;
+                                },
+                                Err(e) => {
+                                    if i == 4 {
+                                        eprintln!("🔥 Lumina IO Error: Failed to open/lock {:?} after 5 attempts: {}", target_path, e);
+                                    } else {
+                                        thread::sleep(Duration::from_millis(20));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(writer) = writer_opt {
+                        // Ignore write errors to avoid panic
+                        let _ = writer.write_all(&data);
+                    }
                 },
                 WriterMsg::TextLine { line, target_path } => {
-                     let writer = file_map.entry(target_path.clone()).or_insert_with(|| {
-                        open_writer(&target_path, false).unwrap()
-                    });
-                    let _ = writer.write_all(line.as_bytes());
+                    let mut writer_opt = file_map.get_mut(&target_path);
+                    
+                    // RETRY LOGIC for Text
+                    if writer_opt.is_none() {
+                        for i in 0..5 {
+                            match open_writer(&target_path, false) {
+                                Ok(w) => {
+                                    file_map.insert(target_path.clone(), w);
+                                    writer_opt = file_map.get_mut(&target_path);
+                                    break;
+                                },
+                                Err(e) => {
+                                    if i == 4 {
+                                        eprintln!("🔥 Lumina IO Error: Failed to open/lock {:?} after 5 attempts: {}", target_path, e);
+                                    } else {
+                                        thread::sleep(Duration::from_millis(20));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(writer) = writer_opt {
+                        let _ = writer.write_all(line.as_bytes());
+                    }
                 },
                 WriterMsg::Flush => {
                     for w in file_map.values_mut() { let _ = w.flush(); }
