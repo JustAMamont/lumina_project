@@ -1,14 +1,15 @@
-name: Lumina Cross-Platform Build
+name: Lumina Release Build
 
 on:
+  # Trigger the workflow when a tag starting with "v" is pushed (e.g., v0.1.0)
   push:
-    branches: [ "main", "master" ]
-    paths:
-      - 'src/**'
-      - 'Cargo.toml'
-      - 'pyproject.toml'
-      - '.github/workflows/lumina_cross_platform.yml'
+    tags:
+      - "v*"
+  # Allow manual trigger from GitHub Actions tab for testing
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -23,6 +24,7 @@ jobs:
             platform: linux
             cargo_bin_name: lumina
             final_bin_name: lumina-read-linux
+            # Zig is required for manylinux compatibility
             maturin_args: "--zig"
           
           # === WINDOWS ===
@@ -30,6 +32,7 @@ jobs:
             platform: windows
             cargo_bin_name: lumina.exe
             final_bin_name: lumina-read-windows.exe
+            # Use native MSVC on Windows
             maturin_args: ""
           
           # === MACOS (Apple Silicon) ===
@@ -37,6 +40,7 @@ jobs:
             platform: macos
             cargo_bin_name: lumina
             final_bin_name: lumina-read-macos
+            # Use native Clang on macOS
             maturin_args: ""
 
     steps:
@@ -56,33 +60,62 @@ jobs:
         python -m pip install --upgrade pip
         pip install maturin ziglang
         
+        # Patchelf is only needed for Linux builds to fix shared library paths
         if [ "${{ matrix.platform }}" == "linux" ]; then
           pip install patchelf
         fi
 
+    # 1. Build Python Wheel (.whl)
     - name: Build Python Wheel
       shell: bash
       run: |
         maturin build --release ${{ matrix.maturin_args }} --out dist
 
+    # 2. Build Standalone Rust Binary (Reader)
     - name: Build Rust Binary
       shell: bash
       run: |
-        # --no-default-features disables the "extension-module" (PyO3) feature
-        # This prevents linking errors on macOS and produces a standalone binary
+        # --no-default-features disables the "extension-module" (PyO3) feature.
+        # This creates a pure Rust binary that does not depend on libpython.
         cargo build --release --bin lumina --no-default-features
 
+    # 3. Rename and move artifacts
     - name: Prepare Artifacts
       shell: bash
       run: |
         SRC_BIN="target/release/${{ matrix.cargo_bin_name }}"
         DST_BIN="dist/${{ matrix.final_bin_name }}"
         
-        echo "Moving $SRC_BIN to $DST_BIN"
+        echo "Moving binary from $SRC_BIN to $DST_BIN"
         cp "$SRC_BIN" "$DST_BIN"
 
+    # 4. Upload artifacts to temp storage
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: lumina-build-${{ matrix.platform }}
+        name: artifacts-${{ matrix.platform }}
         path: dist/*
+
+  # === PUBLISH RELEASE JOB ===
+  publish:
+    name: Create GitHub Release
+    # Wait for all build jobs to finish successfully
+    needs: build
+    runs-on: ubuntu-latest
+    # Only run this job if the trigger was a tag
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      # Download artifacts from all previous jobs (Linux, Win, Mac)
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_dist
+          merge-multiple: true
+
+      # Create a new Release and attach the files
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: all_dist/*
+          generate_release_notes: true
