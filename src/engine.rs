@@ -9,7 +9,7 @@ use std::sync::Arc;
 use ahash::AHasher; 
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::io::{stdout, Write, Seek, BufWriter}; 
+use std::io::{stdout, Write, Seek, BufWriter, Read, SeekFrom, BufReader}; 
 use std::env; 
 use std::path::{Path, PathBuf}; 
 use std::fs::{self, OpenOptions, File}; 
@@ -18,7 +18,7 @@ use sysinfo::{Pid, System};
 use indexmap::IndexMap;
 use rustc_hash::FxHasher;
 use bincode::Options;
-use byteorder::{WriteBytesExt, LittleEndian};
+use byteorder::{LittleEndian, ByteOrder, WriteBytesExt};
 use crc32fast::Hasher as Crc32Hasher;
 use fs2::FileExt;
 use chrono::DateTime; 
@@ -694,7 +694,7 @@ fn run_worker(
 
                 let is_dup = if let Some(ref last) = last_entry {
                     last.level == entry.level && last.message == entry.message && last.exc_hash == entry.exc_hash && 
-                    last.app_name == entry.app_name && last.context_hash == entry.context_hash && entry.to_console == last.to_console 
+                    last.app_name == entry.app_name && last.context_hash == entry.context_hash && last.to_console == entry.to_console 
                 } else { false };
 
                 if is_dup {
@@ -783,6 +783,7 @@ fn flush_binary_buffer(buf: &mut Vec<BinaryLogRecord>, last_log: &LogEntry, writ
         let compressed_len = compressed_data.len() as u32;
 
         let mut blob = Vec::with_capacity(8 + compressed_data.len());
+        // This is where WriteBytesExt trait is needed
         let _ = blob.write_u32::<LittleEndian>(checksum);
         let _ = blob.write_u32::<LittleEndian>(compressed_len);
         blob.extend_from_slice(&compressed_data);
@@ -849,61 +850,45 @@ fn run_writer(rx: Receiver<WriterMsg>) {
         match rx.recv() {
             Ok(msg) => match msg {
                 WriterMsg::BinaryBlock { data, target_path } => {
-                    let mut writer_opt = file_map.get_mut(&target_path);
-                    
-                    // RETRY LOGIC for Binary
-                    // If the file is not already open, try to open it multiple times
-                    if writer_opt.is_none() {
-                        for i in 0..5 {
-                            match open_writer(&target_path, true) {
-                                Ok(w) => {
-                                    file_map.insert(target_path.clone(), w);
-                                    writer_opt = file_map.get_mut(&target_path);
-                                    break;
-                                },
-                                Err(e) => {
-                                    // If this was the last attempt, log the failure to stderr
-                                    if i == 4 {
-                                        eprintln!("🔥 Lumina IO Error: Failed to open/lock {:?} after 5 attempts: {}", target_path, e);
-                                    } else {
-                                        // Wait a bit before retrying
-                                        thread::sleep(Duration::from_millis(20));
-                                    }
-                                }
+                    // Get a mutable reference to the writer if it exists in the map
+                    if !file_map.contains_key(&target_path) {
+                        // If it doesn't exist, try to open and repair it
+                        match open_and_repair_writer(&target_path, true) {
+                            Ok(writer) => {
+                                file_map.insert(target_path.clone(), writer);
+                            },
+                            Err(e) => {
+                                eprintln!("🔥 Lumina IO Error: Failed to open/lock/repair file {:?}: {}", target_path, e);
+                                // Skip this message, but keep the writer thread alive
+                                continue;
                             }
                         }
                     }
-
-                    if let Some(writer) = writer_opt {
-                        // Ignore write errors to avoid panic (keep the thread alive)
-                        let _ = writer.write_all(&data);
+                    
+                    // Now we are sure the key exists if open_and_repair_writer succeeded
+                    if let Some(writer) = file_map.get_mut(&target_path) {
+                        if let Err(e) = writer.write_all(&data) {
+                             eprintln!("🔥 Lumina IO Error: Failed to write to {:?}: {}", target_path, e);
+                        }
                     }
                 },
                 WriterMsg::TextLine { line, target_path } => {
-                    let mut writer_opt = file_map.get_mut(&target_path);
-                    
-                    // RETRY LOGIC for Text
-                    if writer_opt.is_none() {
-                        for i in 0..5 {
-                            match open_writer(&target_path, false) {
-                                Ok(w) => {
-                                    file_map.insert(target_path.clone(), w);
-                                    writer_opt = file_map.get_mut(&target_path);
-                                    break;
-                                },
-                                Err(e) => {
-                                    if i == 4 {
-                                        eprintln!("🔥 Lumina IO Error: Failed to open/lock {:?} after 5 attempts: {}", target_path, e);
-                                    } else {
-                                        thread::sleep(Duration::from_millis(20));
-                                    }
-                                }
+                    // Same logic as above but for text files
+                     if !file_map.contains_key(&target_path) {
+                        match open_and_repair_writer(&target_path, false) {
+                            Ok(writer) => {
+                                file_map.insert(target_path.clone(), writer);
+                            },
+                            Err(e) => {
+                                eprintln!("🔥 Lumina IO Error: Failed to open/lock/repair file {:?}: {}", target_path, e);
+                                continue;
                             }
                         }
                     }
-
-                    if let Some(writer) = writer_opt {
-                        let _ = writer.write_all(line.as_bytes());
+                    if let Some(writer) = file_map.get_mut(&target_path) {
+                        if let Err(e) = writer.write_all(line.as_bytes()) {
+                            eprintln!("🔥 Lumina IO Error: Failed to write to {:?}: {}", target_path, e);
+                        }
                     }
                 },
                 WriterMsg::Flush => {
@@ -924,25 +909,80 @@ fn run_writer(rx: Receiver<WriterMsg>) {
     }
 }
 
-fn open_writer(path: &PathBuf, is_binary: bool) -> Result<BufWriter<File>, std::io::Error> {
+/// Opens a writer for the given path.
+/// If the file is binary and potentially corrupt, it will be validated and truncated.
+fn open_and_repair_writer(path: &PathBuf, is_binary: bool) -> Result<BufWriter<File>, std::io::Error> {
     if let Some(p) = path.parent() { 
         if !p.exists() { 
             fs::create_dir_all(p)?;
         } 
     }
     
-    let file = OpenOptions::new().write(true).create(true).append(true).open(path)?;
+    // Open with read/write permissions for potential repair
+    let mut file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
     
+    // Try to get an exclusive lock to prevent race conditions during repair
     if file.try_lock_exclusive().is_err() {
         return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("Could not lock file {:?}", path)));
     }
-    
-    let buffer_size = if is_binary { BINARY_FILE_BUFFER_SIZE } else { TEXT_FILE_BUFFER_SIZE };
-    let mut writer = BufWriter::with_capacity(buffer_size, file);
-    
-    if is_binary && writer.stream_position()? == 0 {
-        writer.write_all(MAGIC_HEADER)?;
+
+    if is_binary {
+        let file_len = file.metadata()?.len();
+
+        // If file is new or just contains the header, no need to repair.
+        if file_len <= 4 {
+             if file_len == 0 {
+                file.write_all(MAGIC_HEADER)?;
+             }
+        } else {
+            // File has content, validate and find the last good position
+            file.seek(SeekFrom::Start(0))?;
+            let mut reader = BufReader::new(&file);
+            let mut magic = [0u8; 4];
+            
+            // Check header, truncate if invalid
+            if reader.read_exact(&mut magic).is_err() || magic != *MAGIC_HEADER {
+                eprintln!("⚠️ Lumina: Invalid header in {:?}. Truncating file.", path);
+                file.set_len(0)?;
+                file.write_all(MAGIC_HEADER)?;
+            } else {
+                let mut last_valid_pos = 4; // Start after header
+                loop {
+                    let mut crc_bytes = [0u8; 4];
+                    if reader.read_exact(&mut crc_bytes).is_err() { break; } // EOF, clean exit
+                    
+                    let mut len_bytes = [0u8; 4];
+                    if reader.read_exact(&mut len_bytes).is_err() { break; } // Corrupted block
+                    
+                    let len = LittleEndian::read_u32(&len_bytes) as usize;
+                    if len > 50 * 1024 * 1024 { break; } // Sanity check
+
+                    let mut compressed = vec![0u8; len];
+                    if reader.read_exact(&mut compressed).is_err() { break; } // Corrupted block
+                    
+                    let mut hasher = Crc32Hasher::new();
+                    hasher.update(&compressed);
+                    
+                    if hasher.finalize() == LittleEndian::read_u32(&crc_bytes) {
+                        // This block is valid, update position
+                        last_valid_pos = reader.stream_position()?;
+                    } else {
+                        // CRC mismatch, this is where corruption starts
+                        break; 
+                    }
+                }
+
+                if last_valid_pos < file_len {
+                    eprintln!("⚠️ Lumina: Detected corruption at the end of {:?}. Repairing by truncating.", path);
+                    file.set_len(last_valid_pos)?;
+                }
+            }
+        }
     }
-    
-    Ok(writer)
+
+    // Now that the file is repaired and locked, seek to the end for appending
+    file.seek(SeekFrom::End(0))?;
+
+    let buffer_size = if is_binary { BINARY_FILE_BUFFER_SIZE } else { TEXT_FILE_BUFFER_SIZE };
+    Ok(BufWriter::with_capacity(buffer_size, file))
 }
