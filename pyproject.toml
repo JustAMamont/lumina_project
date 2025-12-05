@@ -8,7 +8,7 @@ build-backend = "maturin"
 
 [project]
 name = "lumina"
-version = "0.1.0"
+version = "0.1.1"
 description = "Structured, Binary Logging for Python (Rust Backend)"
 requires-python = ">=3.12"
 readme = "README.md"
